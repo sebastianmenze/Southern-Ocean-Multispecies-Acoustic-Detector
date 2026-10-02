@@ -105,8 +105,8 @@ docker run --gpus all --rm -it \
     somad run_inference.py --help
 ```
 
-Drop `--gpus all` to run on CPU (inference is fine on CPU; training is not
-practical without a GPU).
+Omit `--gpus all` to run on CPU. Inference is practical on CPU; training
+is not.
 
 ### Option B: without Docker
 
@@ -126,16 +126,15 @@ Dockerfile installs via `apt-get` inside the container.
 
 ## Getting the checkpoint
 
-This repository ships the code only. The trained weights
+This repository provides the source code. Trained weights
 (`checkpoints/best_model.pth`, ~1.9 GB) are archived separately on
 **Zenodo** — [DOI: 10.5281/zenodo.23099517](https://doi.org/10.5281/zenodo.23099517) —
-rather than committed to git or tracked with Git LFS: GitHub's free LFS
-quota (1 GB storage, 1 GB/month bandwidth) is smaller than this one file,
-while Zenodo has no such cap and mints a permanent DOI, which is also what
-the paper's data availability statement cites.
+which provides a permanent identifier cited in the manuscript's data
+availability statement.
 
 `checkpoints/thresholds_joint_continuous.csv` (the calibrated per-class
-decision thresholds, a few KB) does ship with the repo, since it's tiny.
+decision thresholds) is small enough to be tracked directly in the
+repository.
 
 Download the checkpoint once after cloning:
 
@@ -143,8 +142,8 @@ Download the checkpoint once after cloning:
 curl -L -o checkpoints/best_model.pth https://zenodo.org/records/23099517/files/best_model.pth
 ```
 
-The file ends up at `checkpoints/best_model.pth`, which is what every
-training/inference command in this README expects.
+The downloaded file must be placed at `checkpoints/best_model.pth`, the
+path expected by every training and inference command in this document.
 
 ## Running inference on new recordings
 
@@ -157,14 +156,16 @@ python src/run_inference.py \
     --out scores_joint.nc
 ```
 
-`--fusion-mode` is not a flag here: `run_inference.py` reads it straight out
-of the checkpoint's own saved metadata (`twotower`, matching how SOMAD was
-trained), so there's no way to get this mismatched by accident.
+`--fusion-mode` is not a required argument here: `run_inference.py` reads
+it directly from the checkpoint's saved metadata (`twotower`, matching
+SOMAD's training configuration), eliminating the possibility of a mismatch
+between model and inference settings.
 
-This produces one netCDF file with, for every input file: raw per-class,
-per-0.5&nbsp;s-bin scores (logits), each class's calibrated threshold, and
-the resulting above-threshold boolean -- nothing lossy happens to the raw
-scores, so you can revisit the threshold later without rerunning the model.
+The output is a single netCDF file containing, for each input recording:
+raw per-class, per-0.5&nbsp;s-bin scores (logits), each class's calibrated
+threshold, and the resulting above-threshold boolean. The raw scores are
+retained without loss, so thresholds can be revised without rerunning the
+model.
 Convert the continuous score file into discrete call events with:
 
 ```bash
@@ -188,11 +189,12 @@ Notes:
   pooling). The other supported values (`stack`, `stack_normfix`,
   `channels`) are single-CNN alternatives used only for the ablations
   discussed in the manuscript.
-- `--bluefin-sites` **with no arguments** uses all 11 circum-Antarctic
-  site-years of the public [IWC-SORP AcousticTrends
+- `--bluefin-sites`, passed **with no arguments**, uses all 11
+  circum-Antarctic site-years of the public [IWC-SORP AcousticTrends
   BlueFinLibrary](https://doi.org/10.26179/5e6056035c01b) (Miller et al.,
-  2021); `train_joint.py`'s own default restricts this to 2 site-years, so
-  don't omit the flag if you want SOMAD's actual training data scope.
+  2021). `train_joint.py`'s default restricts training to 2 site-years;
+  the flag must be included to reproduce SOMAD's actual training data
+  scope.
 - Expected data layout (matching `--data-root`) and every other flag
   (`--epochs`, `--batch-size`, `--lr`, `--val-fraction`, `--seed`, ...) are
   documented in `src/train_lf.py --help` (shared argument parser) and in
