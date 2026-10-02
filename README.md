@@ -128,7 +128,7 @@ Dockerfile installs via `apt-get` inside the container.
 
 This repository ships the code only. The trained weights
 (`checkpoints/best_model.pth`, ~1.9 GB) are archived separately on
-**Zenodo** — [DOI: 10.5281/zenodo.XXXXXXX](https://doi.org/10.5281/zenodo.XXXXXXX) —
+**Zenodo** — [DOI: 10.5281/zenodo.23099517](https://doi.org/10.5281/zenodo.23099517) —
 rather than committed to git or tracked with Git LFS: GitHub's free LFS
 quota (1 GB storage, 1 GB/month bandwidth) is smaller than this one file,
 while Zenodo has no such cap and mints a permanent DOI, which is also what
@@ -140,13 +140,11 @@ decision thresholds, a few KB) does ship with the repo, since it's tiny.
 Download the checkpoint once after cloning:
 
 ```bash
-curl -L -o checkpoints/best_model.pth https://zenodo.org/records/XXXXXXX/files/best_model.pth
+curl -L -o checkpoints/best_model.pth https://zenodo.org/records/23099517/files/best_model.pth
 ```
 
-(Replace `XXXXXXX` with the real record ID once the Zenodo deposit is
-published — see the DOI link above.) The rest of this README's
-training/inference commands are unaffected either way, since the file ends
-up at the same `checkpoints/best_model.pth` path.
+The file ends up at `checkpoints/best_model.pth`, which is what every
+training/inference command in this README expects.
 
 ## Running inference on new recordings
 
