@@ -1,0 +1,16 @@
+# torch/torchvision/torchaudio come from the base image in the Dockerfile
+# (pinned there to match its CUDA build) -- not listed here.
+pandas
+numpy
+scikit-learn
+librosa
+soundfile
+matplotlib
+tqdm
+xarray
+netcdf4
+# v7: common.py's make_shaped_dither (joint model's HF-sub-band on-the-fly
+# upsample dithering) needs scipy.signal directly -- librosa pulls in scipy
+# transitively already, but this is a direct import, not something to rely
+# on staying true as a side effect of another package's own dependencies.
+scipy

@@ -1,0 +1,5 @@
+# The trained checkpoint (~1.9 GB) is NOT tracked in this repo at all --
+# see README.md's "Getting the checkpoint" section. It's archived on
+# Zenodo instead (DOI, free, no bandwidth cap unlike GitHub's free LFS
+# quota), downloaded as a separate step rather than committed/LFS-tracked
+# here. No LFS filter needed as a result.
