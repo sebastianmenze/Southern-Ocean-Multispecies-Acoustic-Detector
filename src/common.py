@@ -292,6 +292,42 @@ SOI_LABEL_MAP = {
 }
 
 # --------------------------------------------------------------------------
+# v13: classes, label maps and per-source scope now come from
+# class_config.json (see class_config.py). The literal lists/maps above are
+# only the v12 defaults the config is mutated INTO, in place -- every
+# existing reference (BAND_LABELS, the dataset, scripts that import
+# common.JOINT_LABELS...) keeps pointing at the same list/dict objects.
+# Adding a class later = edit class_config.json, no code change here.
+# --------------------------------------------------------------------------
+import class_config as _class_config
+
+UNCERTAIN_LABEL_MAP = {}   # raw label -> class whose bins get MASKED (not negative, not positive)
+CLASS_CFG = None
+
+
+def configure_classes(path_or_dict=None):
+    """(Re)load the class/source config and update LF/HF/JOINT_LABELS and the
+    label maps in place. Called once at import with the shipped
+    class_config.json (or $SOMAD_CLASS_CONFIG); call again with a path/dict
+    to switch (train_lf.resolve_defaults does, for --class-config)."""
+    global CLASS_CFG
+    cfg = _class_config.load_class_config(path_or_dict)
+    LF_LABELS[:] = cfg.lf_labels
+    HF_LABELS[:] = cfg.hf_labels
+    JOINT_LABELS[:] = LF_LABELS + HF_LABELS
+    APLOSE_LABEL_MAP.clear()
+    APLOSE_LABEL_MAP.update(cfg.aplose_map)
+    SOI_LABEL_MAP.clear()
+    SOI_LABEL_MAP.update(cfg.soi_map)
+    UNCERTAIN_LABEL_MAP.clear()
+    UNCERTAIN_LABEL_MAP.update(cfg.uncertain_map)
+    CLASS_CFG = cfg
+    return cfg
+
+
+configure_classes()
+
+# --------------------------------------------------------------------------
 # Per-band audio / spectrogram / windowing configuration.
 # LF settings match the old claude_19_lf model; HF settings match the old
 # claude_18_hf model (see nn_bigru_classifier/train_pam_naut_19_lf.py and
@@ -524,10 +560,16 @@ def load_aplose_annotations(csv_path: str) -> pd.DataFrame:
         "end_datetime": pd.to_datetime(df["end_datetime"], utc=True),
         "raw_label": df["annotation"],
         "source": "aplose",
+        "dataset": df["dataset"].astype(str) if "dataset" in df.columns else "aplose",
         "weak": df.get("type", pd.Series("BOX", index=df.index)).eq("WEAK"),
     })
     out["label"] = out["raw_label"].map(APLOSE_LABEL_MAP)
-    out = out.dropna(subset=["label"]).reset_index(drop=True)
+    # v13: "uncertain" raw labels (class_config.json -> uncertain_labels) keep
+    # a row with label=NaN and mask_label=<class>: never a positive, but the
+    # dataset masks those bins out of that class's loss instead of treating
+    # them as confirmed background.
+    out["mask_label"] = out["raw_label"].map(UNCERTAIN_LABEL_MAP)
+    out = out[out["label"].notna() | out["mask_label"].notna()].reset_index(drop=True)
 
     n_weak = int(out["weak"].sum())
     if n_weak:
@@ -539,17 +581,33 @@ def load_aplose_annotations(csv_path: str) -> pd.DataFrame:
 
 def load_soi_annotations(csv_path: str) -> pd.DataFrame:
     """Load the SOI/AURAL annotation CSV (t1/t2/label/audiofilename) into the
-    common schema."""
+    common schema. v13: also accepts an APLOSE-format export of the same
+    annotations (filename/start_datetime/end_datetime/annotation columns),
+    mapped with the SOI label map."""
     df = pd.read_csv(csv_path)
-    out = pd.DataFrame({
-        "file": df["audiofilename"].apply(os.path.basename),
-        "start_datetime": pd.to_datetime(df["t1"], utc=True),
-        "end_datetime": pd.to_datetime(df["t2"], utc=True),
-        "raw_label": df["label"],
-        "source": "soi",
-    })
+    if "audiofilename" not in df.columns and {"filename", "annotation", "start_datetime"} <= set(df.columns):
+        out = pd.DataFrame({
+            "file": df["filename"].astype(str).apply(os.path.basename),
+            "start_datetime": pd.to_datetime(df["start_datetime"], utc=True),
+            "end_datetime": pd.to_datetime(df["end_datetime"], utc=True),
+            "raw_label": df["annotation"],
+            "source": "soi",
+            "dataset": df["dataset"].astype(str) if "dataset" in df.columns else "soi",
+        })
+        weak = df.get("type", pd.Series("BOX", index=df.index)).eq("WEAK").to_numpy()
+        out = out[~weak]
+    else:
+        out = pd.DataFrame({
+            "file": df["audiofilename"].apply(os.path.basename),
+            "start_datetime": pd.to_datetime(df["t1"], utc=True),
+            "end_datetime": pd.to_datetime(df["t2"], utc=True),
+            "raw_label": df["label"],
+            "source": "soi",
+            "dataset": "soi",
+        })
     out["label"] = out["raw_label"].map(SOI_LABEL_MAP)
-    return out.dropna(subset=["label"]).reset_index(drop=True)
+    out["mask_label"] = out["raw_label"].map(UNCERTAIN_LABEL_MAP)
+    return out[out["label"].notna() | out["mask_label"].notna()].reset_index(drop=True)
 
 
 def build_audio_index(audio_dirs) -> dict:
@@ -582,6 +640,7 @@ def resolve_audio_dirs(args, band: str) -> list:
     dirs = [args.hermine_dir, args.soi_train_dir, args.soi_val_dir]
     if band in ("lf", "joint"):
         dirs.append(getattr(args, "bluefin_dir", None))
+    dirs.extend(getattr(args, "extra_audio_dir", None) or [])   # v13: e.g. the DCLDE folder
     return [d for d in dirs if d]
 
 
@@ -670,22 +729,205 @@ def build_dataset_table(aplose_csv, soi_csv: str, audio_dirs, bluefin_dir: str =
     df_anno = df_anno[plausible].reset_index(drop=True)
     assert len(df_anno) == n_before - len(dropped)
 
+    df_anno = drop_out_of_scope_annotations(df_anno, audio_index)
     return df_anno, audio_index
 
 
-def split_files(audio_index: dict, val_fraction: float = 0.15, seed: int = 0):
-    """Deterministic file-level train/val split (no clip ever leaks across
-    the split), stratified by source (aplose vs soi) so validation has
-    representation from both recording sites."""
+def drop_out_of_scope_annotations(df_anno: pd.DataFrame, audio_index: dict) -> pd.DataFrame:
+    """v13: remove annotation rows whose class is outside the scope of the
+    file's source (class_config.json -> annotated_classes / annotated_in).
+    Masking alone zeroes their loss, but they would still count as positives
+    in the rare-class sampler, class weights and bin tables; dropping them
+    makes all of those consistent (e.g. Kerguelen's D-call/downsweep rows)."""
+    if df_anno is None or df_anno.empty or "label" not in df_anno.columns:
+        return df_anno
+    labels = list(JOINT_LABELS)
+    li = {lb: i for i, lb in enumerate(labels)}
+    scope = stem_scope_matrix(df_anno["stem"].unique(), audio_index, labels)
+    keep = [
+        (lb not in li) or bool(scope[st][li[lb]]) if isinstance(lb, str) else True
+        for st, lb in zip(df_anno["stem"].tolist(), df_anno["label"].tolist())
+    ]
+    keep = np.array(keep, dtype=bool)
+    n_drop = int((~keep).sum())
+    if n_drop:
+        d = df_anno.loc[~keep]
+        print(f"Dropping {n_drop} annotation rows of classes outside their source's scope: "
+              f"{d.groupby(['label']).size().to_dict()}")
+    return df_anno[keep].reset_index(drop=True)
+
+
+def stem_sources(audio_index: dict) -> dict:
+    """v13: stem -> source name (class_config.json stem rules, else the
+    audio folder's name)."""
+    return {s: CLASS_CFG.source_of(s, p) for s, p in audio_index.items()}
+
+
+def stem_scope_matrix(stems, audio_index: dict, label_list) -> dict:
+    """v13: stem -> bool array (len(label_list)): was this class actually
+    annotated for this file's source? False = masked out of loss/metrics."""
+    cache, out = {}, {}
+    for s in stems:
+        src = CLASS_CFG.source_of(s, audio_index.get(s))
+        if src not in cache:
+            cache[src] = np.array(CLASS_CFG.scope(src, label_list), dtype=bool)
+        out[s] = cache[src]
+    return out
+
+
+def split_files(audio_index: dict, val_fraction: float = 0.30, seed: int = 0,
+                df_anno: pd.DataFrame = None, verbose: bool = True):
+    """v13 deterministic file-level train/val split (no clip ever leaks
+    across the split).
+
+    Roles come from class_config.json -> sources[*].split:
+      train_only  -- never in validation (e.g. the DCLDE Pacific orca data)
+      val_only    -- never in training
+      random      -- eligible for the random val_fraction draw
+    plus, for random sources, `val_only_classes` (Southern Ocean Orca): any
+    FILE containing an annotation of such a class is forced into
+    validation, so those annotations can never reach training.
+
+    val_fraction is a fraction of the random-eligible files (random-source
+    files incl. the forced ones): forced files count toward it, the rest of
+    the quota is drawn stratified by source. With df_anno=None no file can be
+    forced (callers that need the real split must pass df_anno)."""
     from sklearn.model_selection import train_test_split
 
     stems = sorted(audio_index.keys())
-    sources = ["aplose" if s.startswith("hermine") else "soi" for s in stems]
+    src = stem_sources(audio_index)
+    role = {s: CLASS_CFG.split_role(src[s]) for s in stems}
 
-    train_stems, val_stems = train_test_split(
-        stems, test_size=val_fraction, random_state=seed, stratify=sources
-    )
-    return sorted(train_stems), sorted(val_stems)
+    forced = set()
+    if df_anno is not None and len(df_anno):
+        d = df_anno[df_anno["stem"].isin(src.keys()) & df_anno["label"].notna()]
+        for source in sorted({src[s] for s in d["stem"].unique()}):
+            vo = CLASS_CFG.val_only_classes(source)
+            if not vo:
+                continue
+            ss = d[d["stem"].map(src) == source]
+            forced |= set(ss.loc[ss["label"].isin(vo), "stem"])
+    conflict = [s for s in forced if role[s] != "random"]
+    if conflict and verbose:
+        print(f"WARNING: {len(conflict)} file(s) hold val-only-class annotations but their source's split "
+              f"role is not 'random' -- split role wins: {conflict[:5]}")
+    forced = {s for s in forced if role[s] == "random"}
+
+    ignored = {s for s in stems if role[s] == "ignore"}      # in neither split (see class_config.json)
+    train = {s for s in stems if role[s] == "train_only"}
+    val = {s for s in stems if role[s] == "val_only"} | forced
+    pool = [s for s in stems if role[s] == "random" and s not in forced]
+
+    n_eligible = len(pool) + len(forced)
+    target = int(round(val_fraction * n_eligible))
+    need = max(0, min(len(pool), target - len(forced)))
+    extra = set()
+    if need and need < len(pool):
+        strat = [src[s] for s in pool]
+        counts = {k: strat.count(k) for k in set(strat)}
+        strat = [k if counts[k] >= 2 else "_rare" for k in strat]
+        try:
+            _, extra_l = train_test_split(pool, test_size=need, random_state=seed, stratify=strat)
+        except ValueError:
+            _, extra_l = train_test_split(pool, test_size=need, random_state=seed)
+        extra = set(extra_l)
+    elif need >= len(pool):
+        extra = set(pool)
+    val |= extra
+    train |= set(pool) - extra
+
+    if verbose:
+        rows = {}
+        for s in stems:
+            r = rows.setdefault(src[s], {"train": 0, "val": 0, "forced_val": 0, "ignored": 0})
+            if s in ignored:
+                r["ignored"] += 1
+            elif s in val:
+                r["val"] += 1
+                r["forced_val"] += int(s in forced)
+            else:
+                r["train"] += 1
+        print("split by source (files): " + "; ".join(
+            (f"{k}: IGNORED {v['ignored']}" if v["ignored"] and not (v["train"] or v["val"]) else
+             f"{k}: train {v['train']} / val {v['val']}" + (f" (forced {v['forced_val']})" if v["forced_val"] else ""))
+            for k, v in sorted(rows.items())))
+        print(f"split: {len(train)} train / {len(val)} val files, {len(ignored)} ignored "
+              f"({100 * len(val) / max(1, len(stems) - len(ignored)):.1f}% of used files; "
+              f"{100 * len(val) / max(1, n_eligible):.1f}% of the random-eligible pool; "
+              f"{len(forced)} forced-val for val-only classes)")
+    return sorted(train), sorted(val)
+
+
+def class_bin_table(df_anno: pd.DataFrame, train_stems, val_stems, audio_index: dict, label_list,
+                    interval: float = 0.5) -> pd.DataFrame:
+    """v13: unique positive bins (the labels the model is actually trained /
+    scored on: 0.5 s bins touched by >=1 annotation of the class, overlapping
+    annotations counted once) per class x source x split. Windows overlap and
+    are duplicated for augmentation, so this is the honest "how much label
+    signal is there" number, not a window count."""
+    train_set, val_set = set(train_stems), set(val_stems)
+    d = df_anno[df_anno["label"].isin(list(label_list))]
+    src_cache = {}
+    rows = []
+    for (stem, lb), g in d.groupby(["stem", "label"]):
+        a = np.floor(g["t_1_s"].to_numpy(dtype=float) / interval).astype(int)
+        b = np.maximum(np.ceil(g["t_2_s"].to_numpy(dtype=float) / interval).astype(int), a + 1)
+        order = np.argsort(a, kind="stable")
+        a, b = a[order], b[order]
+        total, cs, ce = 0, a[0], b[0]
+        for x, y in zip(a[1:], b[1:]):
+            if x <= ce:
+                ce = max(ce, y)
+            else:
+                total += ce - cs
+                cs, ce = x, y
+        total += ce - cs
+        if stem not in src_cache:
+            src_cache[stem] = CLASS_CFG.source_of(stem, audio_index.get(stem))
+        split = "train" if stem in train_set else ("val" if stem in val_set else "unused")
+        rows.append((lb, src_cache[stem], split, stem, len(g), int(total)))
+    t = pd.DataFrame(rows, columns=["class", "source", "split", "stem", "annotations", "bins"])
+    if t.empty:
+        return pd.DataFrame(columns=["class", "source", "split", "files", "annotations", "positive_bins"])
+    return (t.groupby(["class", "source", "split"])
+             .agg(files=("stem", "nunique"), annotations=("annotations", "sum"), positive_bins=("bins", "sum"))
+             .reset_index())
+
+
+def _print_split_class_bins(df_anno, train_stems, val_stems, audio_index, label_list):
+    t = class_bin_table(df_anno, train_stems, val_stems, audio_index, label_list)
+    if t.empty:
+        print("(no annotated bins found)")
+        return
+    piv = t.pivot_table(index="class", columns="split", values="positive_bins", aggfunc="sum", fill_value=0)
+    for col in ("train", "val"):
+        if col not in piv.columns:
+            piv[col] = 0
+    print("positive 0.5 s bins per class (unique):")
+    for lb in label_list:
+        tr, va = (int(piv.loc[lb, "train"]), int(piv.loc[lb, "val"])) if lb in piv.index else (0, 0)
+        flag = "  <-- no validation positives (excluded from the selection score)" if va < MIN_VAL_POSITIVE_BINS else ""
+        print(f"  {lb:22s} train {tr:9d}   val {va:7d}{flag}")
+
+
+def get_split(args, audio_index: dict, df_anno: pd.DataFrame, verbose: bool = True):
+    """v13: the split every script should use -- a precomputed one from
+    --split-dir (train_files.txt/val_files.txt, see make_split.py) when given,
+    else computed with split_files. Keeps training, evaluation, the plots
+    and SimSiam pretraining (--exclude-stems-file) on one identical split."""
+    split_dir = getattr(args, "split_dir", None)
+    if split_dir:
+        def _read(n):
+            with open(os.path.join(split_dir, n)) as f:
+                return [l.strip() for l in f if l.strip()]
+        tr = [s for s in _read("train_files.txt") if s in audio_index]
+        va = [s for s in _read("val_files.txt") if s in audio_index]
+        if verbose:
+            print(f"split read from {split_dir}: {len(tr)} train / {len(va)} val files "
+                  f"(of {len(audio_index)} audio files found)")
+        return sorted(tr), sorted(va)
+    return split_files(audio_index, val_fraction=getattr(args, "val_fraction", 0.30),
+                       seed=getattr(args, "seed", 0), df_anno=df_anno, verbose=verbose)
 
 
 MIN_CLASS_COUNT_WARNING = 20
@@ -730,7 +972,19 @@ def compute_window_class_presence(df_data: pd.DataFrame, df_anno: pd.DataFrame, 
     return presence
 
 
-NOISE_POOL_SIZE = 24
+# v10.2: bumped 24 -> 100 default (see --noise-pool-size) -- a small, fixed
+# pool risks two distinct problems: (1) thin coverage of real background
+# diversity (site/weather/vessel-traffic/hydrophone-self-noise variation),
+# and (2) for self-supervised pretraining specifically (no label to anchor
+# what SHOULD make two windows similar), repeatedly mixing the SAME few
+# noise textures into many different windows risks a "shared noise
+# fingerprint" shortcut -- two otherwise-unrelated windows that happen to
+# draw the same pooled sample become artificially more similar than they
+# should be, which SimSiam's loss can't tell apart from genuine acoustic
+# similarity. A larger pool makes that collision far rarer. Still a plain
+# module-level default, not a hard cap -- see PamSequenceDataset's own
+# noise_pool_size constructor parameter / train_lf.py's --noise-pool-size.
+NOISE_POOL_SIZE = 100
 
 # Shared shaped-dither constants for upsampling PAST a file's own native
 # Nyquist -- see make_shaped_dither's docstring. RAMP_START_FRAC/REF_BAND_FRAC
@@ -811,7 +1065,8 @@ def _load_window_waveform(path: str, sr: int, start_sec: float, stop_sec: float)
     return waveform[:, start_sample:stop_sample].numpy().squeeze(0)
 
 
-def augment_waveform(audio: np.ndarray, rng: np.random.Generator, noise_pool: list = None) -> np.ndarray:
+def augment_waveform(audio: np.ndarray, rng: np.random.Generator, noise_pool: list = None,
+                     cfg: dict = None) -> np.ndarray:
     """Gain jitter + additive noise (mixed in from `noise_pool` -- real
     background windows from this training split -- when available, else
     plain Gaussian noise). Mirrors perch_training's
@@ -834,17 +1089,26 @@ def augment_waveform(audio: np.ndarray, rng: np.random.Generator, noise_pool: li
     the probability of mixing in noise at all, and quietened the Gaussian
     fallback to match.
     """
+    # v13: `cfg` (optional) overrides the three knobs below -- only the SimSiam
+    # pretraining dataset passes one; supervised training keeps the v3
+    # conservative defaults exactly (gain +-6 dB, noise 50% of the time at
+    # 6-20 dB SNR).
+    cfg = cfg or {}
+    g_lo, g_hi = cfg.get("gain_db", (-6.0, 6.0))
+    p_noise = cfg.get("noise_prob", 0.5)
+    snr_lo, snr_hi = cfg.get("snr_db", (6.0, 20.0))
+
     out = audio.copy()
 
-    gain_db = rng.uniform(-6.0, 6.0)
+    gain_db = rng.uniform(g_lo, g_hi)
     out = out * (10.0 ** (gain_db / 20.0))
 
-    if noise_pool and rng.random() < 0.5:
+    if noise_pool and rng.random() < p_noise:
         noise = noise_pool[rng.integers(len(noise_pool))]
         if len(noise) != len(out):
             reps = int(np.ceil(len(out) / len(noise)))
             noise = np.tile(noise, reps)[:len(out)]
-        snr_db = rng.uniform(6.0, 20.0)
+        snr_db = rng.uniform(snr_lo, snr_hi)
         sig_power = np.mean(out ** 2) + 1e-12
         noise_power = np.mean(noise ** 2) + 1e-12
         target_noise_power = sig_power / (10.0 ** (snr_db / 10.0))
@@ -860,6 +1124,22 @@ def augment_waveform(audio: np.ndarray, rng: np.random.Generator, noise_pool: li
 # --------------------------------------------------------------------------
 # Dataset
 # --------------------------------------------------------------------------
+
+# v13: SimSiam view generation. v12 made two views of the SAME 60 s window that
+# differed only by +-6 dB gain, noise 50% of the time 6-20 dB down, and 2 mask
+# stripes -- so easy to match that the loss hit -0.99 within 6 epochs (a
+# near-collapse / "match the noise fingerprint" regime). v13 defaults:
+#   crop_min_sec  each view keeps a random contiguous crop of >= this many
+#                 seconds of the window (the rest is masked), so two views of
+#                 a 60 s window share >= 2*crop_min - 60 s (20 s) but differ in
+#                 content; 0 or >= the window length disables (v12 behaviour).
+#                 Done by masking (not re-cutting) so the time scale is kept.
+#   noise_prob/snr_db  foreign background (pool windows from other files, an
+#                 independent draw per view) mixed in more often and louder.
+#   gain_db       unchanged.
+# v12 behaviour: crop_min_sec=0, noise_prob=0.5, snr_db=(6, 20).
+DEFAULT_SIMSIAM_CFG = dict(crop_min_sec=40.0, noise_prob=0.8, snr_db=(0.0, 20.0), gain_db=(-6.0, 6.0))
+
 
 class PamSequenceDataset(Dataset):
     """Cuts each recording into overlapping ``snippet_length_s`` windows,
@@ -883,16 +1163,45 @@ class PamSequenceDataset(Dataset):
 
     def __init__(self, file_stems, audio_index: dict, df_anno: pd.DataFrame,
                  band: str, augment: bool = False, full_coverage: bool = False,
-                 bluefin_hf_dir: str = None, fusion_mode: str = "stack"):
+                 bluefin_hf_dir: str = None, fusion_mode: str = "twotower",
+                 simsiam_pretrain: bool = False, noise_pool_size: int = NOISE_POOL_SIZE,
+                 return_mask: bool = False, simsiam_cfg: dict = None):
         assert band in BAND_CONFIG
         self.band = band
         self.cfg = BAND_CONFIG[band]
-        self.model_labels = BAND_LABELS[band]
+        self.model_labels = list(BAND_LABELS[band])
         self.num_classes = len(self.model_labels)
+        # v13: when True, __getitem__ returns (spec, labels, mask) -- mask is
+        # (num_classes, timesteps), 1 = this class/bin contributes to loss and
+        # metrics, 0 = masked (class not annotated for this file's source, or
+        # an "uncertain" annotation covers the bin). Default False keeps the
+        # (spec, labels) contract inference/plot scripts rely on.
+        self.return_mask = return_mask
+        self.stem_scope = stem_scope_matrix(file_stems, audio_index, self.model_labels)
         self.augment = augment
+        self.noise_pool_size = noise_pool_size
         # v9: only consulted when band=="joint" -- see train_lf.py's
         # --fusion-mode comment.
         self.fusion_mode = fusion_mode
+
+        # v10: self-supervised pretraining mode for the twotower CNN stems
+        # (see SimSiamPretrainModel/run_simsiam_pretraining) -- requires
+        # band=="joint" (needs both sub_bands configs). When True,
+        # __getitem__ returns (view1, view2) -- two independently augmented
+        # {"hf":..., "lf":...} spectrogram pairs of the SAME window -- instead
+        # of (spec, label); no annotations/labels are used at all, so the
+        # df_anno passed in can be (and for pretraining, should be) empty.
+        self.simsiam_pretrain = simsiam_pretrain
+        # v13: view-generation settings for SimSiam pretraining (see
+        # DEFAULT_SIMSIAM_CFG). `augment_cfg` is what augment_waveform sees;
+        # it stays None for supervised training (v3 defaults).
+        self.simsiam_cfg = {**DEFAULT_SIMSIAM_CFG, **(simsiam_cfg or {})}
+        self.augment_cfg = None
+        if simsiam_pretrain:
+            assert band == "joint", "simsiam_pretrain needs band='joint' (pretrains both sub-band CNN towers)"
+            self.augment_cfg = {"noise_prob": self.simsiam_cfg["noise_prob"],
+                                "snr_db": tuple(self.simsiam_cfg["snr_db"]),
+                                "gain_db": tuple(self.simsiam_cfg["gain_db"])}
 
         # v8 (option C wiring): band=="joint" HF sub-band audio for a
         # bluefin-sourced stem gets loaded from here INSTEAD of the file's
@@ -1037,7 +1346,7 @@ class PamSequenceDataset(Dataset):
         if augment:
             bg_idx = np.where(~self.class_presence.any(axis=1))[0]
             pool_rng = np.random.default_rng(0)
-            pick = pool_rng.choice(bg_idx, size=min(NOISE_POOL_SIZE, len(bg_idx)), replace=False) \
+            pick = pool_rng.choice(bg_idx, size=min(self.noise_pool_size, len(bg_idx)), replace=False) \
                 if len(bg_idx) else []
             if band == "joint":
                 for i in pick:
@@ -1300,7 +1609,7 @@ class PamSequenceDataset(Dataset):
             if n_augment > 0:
                 t0 = time.perf_counter() if timing is not None else None
                 rng = np.random.default_rng()
-                augmented = augment_waveform(waveform.numpy().squeeze(0), rng, noise_pool)
+                augmented = augment_waveform(waveform.numpy().squeeze(0), rng, noise_pool, self.augment_cfg)
                 spec_waveform = torch.from_numpy(augmented).unsqueeze(0)
                 if timing is not None:
                     timing.add("augment", time.perf_counter() - t0)
@@ -1346,6 +1655,59 @@ class PamSequenceDataset(Dataset):
         stem = row["stem"]
         n_augment = int(row["n_augment_stripes"])
         cfg = self.cfg
+
+        if self.simsiam_pretrain:
+            # v10: two independently-augmented views of the SAME window,
+            # for SimSiamPretrainModel -- no labels, no fusion_mode (always
+            # twotower-shaped: separate hf/lf spectrograms, never stacked/
+            # concatenated here). Passing the SAME cache_key to both calls
+            # is deliberate, not a bug: _spectrogram_for_subband's
+            # _waveform_cache stores the decoded (pre-augmentation)
+            # waveform, so the second call reuses that decode and only
+            # redraws fresh augmentation (augment_waveform + SpecAugment,
+            # neither of which is ever cached for n_augment>0 rows) --
+            # cheaper than decoding twice, while still giving two genuinely
+            # different augmented spectrograms. n_augment is hardcoded to 2
+            # (not read from row["n_augment_stripes"]) -- run_simsiam_
+            # pretraining DOES build this dataset with augment=True (needed
+            # to populate the real background-noise pool, see __init__'s
+            # own `if augment:` gate), so df_data IS row-doubled here same
+            # as ordinary supervised training, but this branch ignores
+            # n_augment_stripes' actual per-row value either way and always
+            # draws 2 fresh stripes per view regardless of which duplicate
+            # row __getitem__ was called on -- harmless, not a bug.
+            sub = cfg["sub_bands"]
+            hf_path = self.bluefin_hf_index.get(stem, filename)
+
+            def _view():
+                return {
+                    "hf": _minmax_norm(self._spectrogram_for_subband(
+                        hf_path, sub["hf"], sub["hf"]["freq_bins"], self.spec_dim[1],
+                        row["start_sec"], row["stop_sec"], 2, self.noise_pool["hf"],
+                        cache_key=(hf_path, "hf"))),
+                    "lf": _minmax_norm(self._spectrogram_for_subband(
+                        filename, sub["lf"], sub["lf"]["freq_bins"], self.spec_dim[1],
+                        row["start_sec"], row["stop_sec"], 2, self.noise_pool["lf"],
+                        cache_key=(filename, "lf"))),
+                }
+
+            view1, view2 = _view(), _view()
+            crop_min = float(self.simsiam_cfg.get("crop_min_sec") or 0.0)
+            win = float(row["stop_sec"] - row["start_sec"])
+            if 0.0 < crop_min < win:
+                crng = np.random.default_rng()
+                for v in (view1, view2):
+                    L = crng.uniform(crop_min, win)
+                    a = crng.uniform(0.0, win - L)
+                    for key in v:
+                        T = v[key].shape[-1]
+                        i0, i1 = int(round(a / win * T)), int(round((a + L) / win * T))
+                        v[key][..., :i0] = 0.0
+                        v[key][..., i1:] = 0.0
+            if self._timing is not None:
+                self._timing.add("__getitem__ total", time.perf_counter() - item_t0)
+                self._timing.maybe_print(self.band)
+            return view1, view2
 
         if self.band == "joint":
             sub = cfg["sub_bands"]
@@ -1427,6 +1789,23 @@ class PamSequenceDataset(Dataset):
 
         labels = torch.from_numpy(score.T.astype("float32"))
 
+        mask = None
+        if self.return_mask:
+            keep = self.stem_scope.get(stem)
+            mask_np = np.ones((self.num_classes, len(t)), dtype="float32")
+            if keep is not None:
+                mask_np[~keep, :] = 0.0
+            if "mask_label" in df_anno_file.columns:
+                unc = df_anno_file[df_anno_file["mask_label"].notna()]
+                for _, r in unc.iterrows():
+                    if r["mask_label"] not in self.model_labels:
+                        continue
+                    ix_class = self.model_labels.index(r["mask_label"])
+                    b1 = max(np.digitize(r["t_1_s"], t) - 1, 0)
+                    b2 = np.digitize(r["t_2_s"], t)
+                    mask_np[ix_class, b1:max(b2, b1 + 1)] = 0.0
+            mask = torch.from_numpy(mask_np)
+
         # v9: stack_normfix/channels/twotower already normalized (per
         # sub-band) above -- only "stack" (and every non-joint band) still
         # needs the original single joint min-max here.
@@ -1454,6 +1833,8 @@ class PamSequenceDataset(Dataset):
             self._timing.add("__getitem__ total", time.perf_counter() - item_t0)
             self._timing.maybe_print(self.band)
 
+        if self.return_mask:
+            return spec, labels, mask
         return spec, labels
 
 
@@ -1462,20 +1843,27 @@ def compute_class_weights(df_anno_train: pd.DataFrame, file_stems, audio_index: 
     """Inverse-frequency class weights from annotated seconds per class,
     normalized to sum to num_classes (same formula the original scripts used,
     just computed from annotation durations instead of a slow full dataset
-    pass)."""
-    total_duration = 0.0
+    pass).
+
+    v13: scope-aware. A class's "total duration" is only the audio of files
+    whose source was actually annotated for that class (a class masked for
+    a file contributes neither positives nor negatives there), so adding a
+    big single-class dataset doesn't dilute every other class's weight."""
+    scope = stem_scope_matrix(file_stems, audio_index, label_list)
+    dur_per_class = np.zeros(len(label_list))
     for stem in file_stems:
         try:
-            total_duration += sf.info(audio_index[stem]).duration
+            d = sf.info(audio_index[stem]).duration
         except Exception:
-            total_duration += librosa.get_duration(path=audio_index[stem])
+            d = librosa.get_duration(path=audio_index[stem])
+        dur_per_class += d * scope[stem]
 
     class_seconds = np.zeros(len(label_list))
     for i, lb in enumerate(label_list):
         rows = df_anno_train[df_anno_train["label"] == lb]
         class_seconds[i] = (rows["t_2_s"] - rows["t_1_s"]).clip(lower=0).sum()
 
-    weights = total_duration / (len(label_list) * (class_seconds + 1))
+    weights = np.maximum(dur_per_class, 1.0) / (len(label_list) * (class_seconds + 1))
     weights = weights * len(label_list) / weights.sum()
     return torch.tensor(weights, dtype=torch.float32)
 
@@ -1614,6 +2002,82 @@ class ImprovedCNNBiGRU(nn.Module):
         return x.permute(0, 2, 1)
 
 
+class SimSiamPretrainModel(nn.Module):
+    """v10: self-supervised pretraining for ImprovedCNNBiGRU's twotower CNN
+    stems (cnn_hf/cnn_lf) via SimSiam (Chen & He, 2021) -- no labels, no
+    negative pairs, no momentum/EMA teacher (the one thing BYOL needs that
+    this doesn't). Chosen over BYOL for this project specifically because
+    it has one fewer moving part (no EMA decay to tune, no second copy of
+    the encoder to maintain) while relying on the same core mechanism:
+    stop-gradient on one branch plus a predictor MLP is enough on its own
+    to prevent the trivial constant-output collapse any non-contrastive
+    SSL method has to avoid.
+
+    Pretrains the CNN towers ONLY, not the BiGRU/attention/classifier --
+    BYOL/SimSiam are whole-sample methods (one embedding per window), so
+    this answers "what does this 60 s window's spectrogram generally look
+    like", not the temporal reasoning across timesteps the BiGRU still
+    learns entirely from scratch during ordinary supervised fine-tuning
+    (see run_simsiam_pretraining / pretrain_simsiam.py). Reuses
+    ImprovedCNNBiGRU._build_cnn_stem verbatim (identical architecture, so
+    the resulting cnn_hf/cnn_lf state_dicts load straight into a real
+    ImprovedCNNBiGRU(fusion_mode="twotower") afterward -- see
+    run_training's --pretrained-cnn-towers handling).
+
+    Given two independently-augmented views of the SAME window (view1,
+    view2 -- see PamSequenceDataset.__getitem__'s simsiam_pretrain branch),
+    each view's HF+LF spectrograms go through their own CNN tower, get
+    pooled over TIME (mean over the timesteps axis -- there is no sequence
+    model here to consume per-timestep detail) and concatenated at the
+    same point the real twotower model fuses its two towers, then through
+    a projector MLP (-> proj_dim) and, on one branch only in the sense
+    that follows, a predictor MLP (proj_dim -> proj_dim). The loss compares
+    one branch's PREDICTION against the other branch's (gradient-blocked)
+    PROJECTION, symmetrized across both directions -- see simsiam_loss.
+    """
+
+    def __init__(self, pooled_freq_rows=48, timesteps=121, proj_dim=256, pred_hidden=128):
+        super().__init__()
+        self.cnn_hf = ImprovedCNNBiGRU._build_cnn_stem(1, pooled_freq_rows, timesteps)
+        self.cnn_lf = ImprovedCNNBiGRU._build_cnn_stem(1, pooled_freq_rows, timesteps)
+        feat_dim = 512 * pooled_freq_rows * 2  # same concat point the real twotower model uses
+        self.projector = nn.Sequential(
+            nn.Linear(feat_dim, proj_dim), nn.BatchNorm1d(proj_dim), nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim), nn.BatchNorm1d(proj_dim),
+        )
+        self.predictor = nn.Sequential(
+            nn.Linear(proj_dim, pred_hidden), nn.BatchNorm1d(pred_hidden), nn.ReLU(inplace=True),
+            nn.Linear(pred_hidden, proj_dim),
+        )
+
+    def _embed(self, hf_spec, lf_spec):
+        batch_size = hf_spec.size(0)
+        # (B, 512, pooled_freq_rows, timesteps) -> mean over time -> (B, 512, pooled_freq_rows)
+        hf_feat = self.cnn_hf(hf_spec).mean(dim=3)
+        lf_feat = self.cnn_lf(lf_spec).mean(dim=3)
+        feat = torch.cat([hf_feat.reshape(batch_size, -1), lf_feat.reshape(batch_size, -1)], dim=1)
+        return self.projector(feat)
+
+    def forward(self, view1: dict, view2: dict):
+        z1 = self._embed(view1["hf"], view1["lf"])
+        z2 = self._embed(view2["hf"], view2["lf"])
+        p1 = self.predictor(z1)
+        p2 = self.predictor(z2)
+        return p1, p2, z1.detach(), z2.detach()
+
+
+def simsiam_loss(p1, p2, z1, z2):
+    """Symmetrized negative cosine similarity -- z1/z2 must already be
+    detached (SimSiamPretrainModel.forward does this); backpropagating
+    through them too would remove the stop-gradient asymmetry that
+    prevents collapse, defeating the entire method."""
+    def neg_cos_sim(p, z):
+        p = F.normalize(p, dim=1)
+        z = F.normalize(z, dim=1)
+        return -(p * z).sum(dim=1).mean()
+    return 0.5 * (neg_cos_sim(p1, z2) + neg_cos_sim(p2, z1))
+
+
 # --------------------------------------------------------------------------
 # Loss + metrics
 # --------------------------------------------------------------------------
@@ -1626,7 +2090,7 @@ class WeightedFocalLoss(nn.Module):
         self.gamma = gamma
         self.reduction = reduction
 
-    def forward(self, inputs, targets):
+    def forward(self, inputs, targets, mask=None):
         bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
         pt = torch.exp(-bce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
@@ -1634,6 +2098,15 @@ class WeightedFocalLoss(nn.Module):
         if self.class_weights is not None:
             weights = self.class_weights.view(1, -1, 1).to(inputs.device)
             focal_loss = focal_loss * weights
+
+        # v13: mask (same shape as targets, 1 = counts, 0 = ignored) -- the
+        # masked mean divides by the number of COUNTED elements, so with an
+        # all-ones mask this is exactly the old .mean().
+        if mask is not None:
+            mask = mask.to(inputs.device, dtype=focal_loss.dtype)
+            focal_loss = focal_loss * mask
+            if self.reduction == "mean":
+                return focal_loss.sum() / mask.sum().clamp_min(1.0)
 
         if self.reduction == "mean":
             return focal_loss.mean()
@@ -1651,23 +2124,36 @@ class WeightedCombinedLoss(nn.Module):
         self.class_weights = class_weights
         self.bce_loss = nn.BCEWithLogitsLoss(reduction="none" if class_weights is not None else "mean")
 
-    def forward(self, inputs, targets):
-        focal = self.focal_loss(inputs, targets)
-        if self.class_weights is not None:
-            bce = self.bce_loss(inputs, targets)
-            weights = self.class_weights.view(1, -1, 1).to(inputs.device)
-            bce = (bce * weights).mean()
+    def forward(self, inputs, targets, mask=None):
+        focal = self.focal_loss(inputs, targets, mask)
+        if self.class_weights is not None or mask is not None:
+            bce = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+            if self.class_weights is not None:
+                bce = bce * self.class_weights.view(1, -1, 1).to(inputs.device)
+            if mask is not None:
+                m = mask.to(inputs.device, dtype=bce.dtype)
+                bce = (bce * m).sum() / m.sum().clamp_min(1.0)
+            else:
+                bce = bce.mean()
         else:
             bce = self.bce_loss(inputs, targets)
         return self.alpha * focal + self.beta * bce
 
 
-def compute_class_wise_f1(preds, targets, threshold=0.5, num_classes=5):
+def compute_class_wise_f1(preds, targets, threshold=0.5, num_classes=5, masks=None):
+    """Frame-level F1 per class at a fixed threshold. v13: `masks` (same shape
+    as targets) excludes masked frames from TP/FP/FN, and the macro average is
+    over classes that have at least one positive among the counted frames
+    (a class with no positives in this split can't score, and must not drag
+    the mean down as a hard 0)."""
     preds_bin = (torch.sigmoid(preds) > threshold).float()
-    f1_scores = []
+    f1_scores, supported = [], []
     for class_idx in range(num_classes):
         pred_class = preds_bin[:, class_idx, :].flatten()
         target_class = targets[:, class_idx, :].flatten()
+        if masks is not None:
+            keep = masks[:, class_idx, :].flatten() > 0.5
+            pred_class, target_class = pred_class[keep], target_class[keep]
 
         tp = (pred_class * target_class).sum().item()
         fp = (pred_class * (1 - target_class)).sum().item()
@@ -1677,8 +2163,62 @@ def compute_class_wise_f1(preds, targets, threshold=0.5, num_classes=5):
         recall = tp / (tp + fn + 1e-8)
         f1 = 2 * precision * recall / (precision + recall + 1e-8)
         f1_scores.append(f1)
+        supported.append(float(target_class.sum().item()) > 0)
 
-    return float(np.mean(f1_scores)), f1_scores
+    if masks is None:
+        return float(np.mean(f1_scores)), f1_scores
+    sup = [f for f, s in zip(f1_scores, supported) if s]
+    return (float(np.mean(sup)) if sup else 0.0), f1_scores
+
+
+MIN_VAL_POSITIVE_BINS = 20   # a class needs this many positive 0.5 s bins in val to enter the macro score
+
+
+def masked_class_metrics(logits, targets, masks=None, threshold=0.5, min_pos=None):
+    """v13 validation metrics, computed ONLY on frames where the class is in
+    scope (masks == 1):
+
+      ap      -- per-class average precision (threshold-free, robust to the
+                 extreme class imbalance); NaN for a class with fewer than
+                 `min_pos` positive bins (too few to score reliably).
+      f1      -- per-class F1 at `threshold` (kept for continuity with v12).
+      macro_ap / macro_f1 -- means over the supported classes only.
+
+    macro_ap is the model-selection / LR-scheduler / early-stopping score in
+    run_training (v12 used the unweighted mean F1@0.5 over all classes)."""
+    from sklearn.metrics import average_precision_score
+    min_pos = MIN_VAL_POSITIVE_BINS if min_pos is None else min_pos
+    probs = torch.sigmoid(logits)
+    C = logits.shape[1]
+    ap, f1, n_pos, n_valid = [], [], [], []
+    for c in range(C):
+        y = targets[:, c, :].reshape(-1)
+        p = probs[:, c, :].reshape(-1)
+        if masks is not None:
+            keep = masks[:, c, :].reshape(-1) > 0.5
+            y, p = y[keep], p[keep]
+        npos = int((y > 0.5).sum().item())
+        n_pos.append(npos)
+        n_valid.append(int(y.numel()))
+        pred = p > threshold
+        pos = y > 0.5
+        tp = float((pred & pos).sum().item())
+        fp = float((pred & ~pos).sum().item())
+        fn = float((~pred & pos).sum().item())
+        prec = tp / (tp + fp + 1e-8)
+        rec = tp / (tp + fn + 1e-8)
+        f1.append(2 * prec * rec / (prec + rec + 1e-8))
+        if npos >= min_pos and npos < y.numel():
+            ap.append(float(average_precision_score(pos.numpy().astype(np.uint8), p.numpy())))
+        else:
+            ap.append(float("nan"))
+    ap_arr = np.array(ap, dtype=float)
+    sup_f1 = [f for f, n in zip(f1, n_pos) if n > 0]
+    return {
+        "ap": ap, "f1": f1, "n_pos": n_pos, "n_valid": n_valid,
+        "macro_ap": float(np.nanmean(ap_arr)) if np.isfinite(ap_arr).any() else 0.0,
+        "macro_f1": float(np.mean(sup_f1)) if sup_f1 else 0.0,
+    }
 
 
 def smooth_binary_predictions(binary_seq: np.ndarray, min_duration_bins: int = 1,
@@ -2026,20 +2566,33 @@ def run_inference_continuous_singleprocess(model, dataset, device, batch_size: i
 # Training / validation loops
 # --------------------------------------------------------------------------
 
+def _unpack_batch(batch, device):
+    """v13: loaders built with return_mask=True yield (x, y, mask); older
+    (x, y) loaders still work (mask=None)."""
+    if len(batch) == 3:
+        x, y, m = batch
+        return _to_device(x, device), y.to(device, non_blocking=True), m.to(device, non_blocking=True)
+    x, y = batch
+    return _to_device(x, device), y.to(device, non_blocking=True), None
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch, num_classes,
                      scaler=None):
+    """Returns a dict: loss, f1 (masked macro F1@0.5, supported classes only),
+    class_f1. (AP is only computed in validate -- on the training stream it
+    would be both slow and distorted by the rare-class sampler.)"""
     model.train()
     total_loss = 0
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_masks = [], [], []
 
-    for x, y in tqdm(loader, desc=f"Epoch {epoch} train"):
-        x, y = _to_device(x, device), y.to(device, non_blocking=True)
+    for batch in tqdm(loader, desc=f"Epoch {epoch} train"):
+        x, y, m = _unpack_batch(batch, device)
 
         optimizer.zero_grad()
         if scaler is not None:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 outputs = model(x)
-                loss = criterion(outputs, y)
+                loss = criterion(outputs, y, m)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -2047,39 +2600,235 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, num_clas
             scaler.update()
         else:
             outputs = model(x)
-            loss = criterion(outputs, y)
+            loss = criterion(outputs, y, m)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         total_loss += loss.item()
-        all_preds.append(outputs.detach().cpu())
+        all_preds.append(outputs.detach().float().cpu())
         all_targets.append(y.detach().cpu())
+        if m is not None:
+            all_masks.append(m.detach().cpu())
 
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
-    avg_f1, class_f1s = compute_class_wise_f1(all_preds, all_targets, num_classes=num_classes)
-    return total_loss / len(loader), avg_f1, class_f1s
+    all_masks = torch.cat(all_masks, dim=0) if all_masks else None
+    avg_f1, class_f1s = compute_class_wise_f1(all_preds, all_targets, num_classes=num_classes, masks=all_masks)
+    return {"loss": total_loss / len(loader), "f1": avg_f1, "class_f1": class_f1s}
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, num_classes):
+def validate(model, loader, criterion, device, num_classes, min_pos=None):
+    """Returns the masked_class_metrics dict plus 'loss'."""
     model.eval()
     total_loss = 0
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_masks = [], [], []
 
-    for x, y in tqdm(loader, desc="Validation"):
-        x, y = _to_device(x, device), y.to(device, non_blocking=True)
+    for batch in tqdm(loader, desc="Validation"):
+        x, y, m = _unpack_batch(batch, device)
         outputs = model(x)
-        loss = criterion(outputs, y)
+        loss = criterion(outputs, y, m)
         total_loss += loss.item()
-        all_preds.append(outputs.cpu())
+        all_preds.append(outputs.float().cpu())
         all_targets.append(y.cpu())
+        if m is not None:
+            all_masks.append(m.cpu())
 
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
-    avg_f1, class_f1s = compute_class_wise_f1(all_preds, all_targets, num_classes=num_classes)
-    return total_loss / len(loader), avg_f1, class_f1s
+    all_masks = torch.cat(all_masks, dim=0) if all_masks else None
+    res = masked_class_metrics(all_preds, all_targets, all_masks, min_pos=min_pos)
+    res["loss"] = total_loss / len(loader)
+    return res
+
+
+def run_simsiam_pretraining(args):
+    """v10: self-supervised pretraining entrypoint for SimSiamPretrainModel
+    -- see pretrain_simsiam.py, the CLI script that actually calls this.
+    Separate from run_training (which needs labels/thresholds/event
+    metrics that don't exist here): trains on RAW AUDIO ONLY, no
+    annotations, over whatever --audio-dir(s) you point it at -- meant to
+    run over a much larger pool than the APLOSE-labeled subset (e.g. this
+    project's full multi-year mooring archives), which is the entire
+    point of pretraining at all.
+
+    Both train AND val datasets are built with augment=True (unlike
+    ordinary supervised training, where val always stays clean) -- two
+    reasons: (1) it's what populates PamSequenceDataset's real
+    background-noise pool (see __init__'s `if augment:` gate), needed for
+    augment_waveform's noise-mixing branch rather than falling back to
+    plain Gaussian noise; (2) SimSiam's loss is only meaningful between two
+    genuinely DIFFERENT augmented views -- an unaugmented "clean" pair
+    would make view1 identical to view2, a degenerate case the loss can't
+    actually measure anything from. The resulting row-doubling (each
+    window appearing twice per nominal epoch, see __init__'s `if augment:
+    df_data_2 = ...`) is harmless here, since simsiam_pretrain mode ignores
+    n_augment_stripes entirely and always draws 2 fresh stripes per view
+    regardless of which duplicate row it's reached from.
+
+    Saves latest_checkpoint.pth every epoch and best_cnn_towers.pth
+    whenever val loss improves -- the latter's "cnn_hf_state_dict"/
+    "cnn_lf_state_dict" keys are what train_joint.py's
+    --pretrained-cnn-towers loads into a fresh ImprovedCNNBiGRU
+    (fusion_mode="twotower") for supervised fine-tuning (see run_training's
+    own --pretrained-cnn-towers handling). "config" is saved alongside so a
+    mismatched pooled_freq_rows/timesteps gets a clear error instead of a
+    silent shape-mismatch crash three lines into load_state_dict.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"SimSiam pretraining | device: {device}")
+
+    audio_dirs = args.audio_dir if isinstance(args.audio_dir, list) else [args.audio_dir]
+    audio_index = build_audio_index(audio_dirs)
+    print(f"Found {len(audio_index)} audio files under {audio_dirs}")
+    if not audio_index:
+        raise SystemExit(f"No .wav files found under {audio_dirs}")
+
+    # v13: keep the supervised run's validation files (see make_split.py ->
+    # val_files.txt) OUT of pretraining, so the self-supervised stage never
+    # sees the audio the final metrics are measured on.
+    # v13: --exclude-sources GLOB...: drop whole data sources from pretraining by their class_config.json
+    # source name (e.g. "bluefin_*": 500 Hz recordings upsampled to 32 kHz carry no real HF content, so
+    # they are of no use for pretraining the HF tower).
+    import fnmatch as _fn
+    ex_src = getattr(args, "exclude_sources", None) or []
+    if ex_src:
+        n0 = len(audio_index)
+        audio_index = {s: p for s, p in audio_index.items()
+                       if not any(_fn.fnmatchcase(CLASS_CFG.source_of(s, p), g) for g in ex_src)}
+        print(f"--exclude-sources {ex_src}: dropped {n0 - len(audio_index)} file(s) from pretraining "
+              f"({len(audio_index)} remain)")
+        if not audio_index:
+            raise SystemExit("All audio files were excluded -- nothing left to pretrain on")
+    exclude_file = getattr(args, "exclude_stems_file", None)
+    if exclude_file:
+        with open(exclude_file) as f:
+            excl = {l.strip() for l in f if l.strip()}
+        n0 = len(audio_index)
+        audio_index = {s: p for s, p in audio_index.items() if s not in excl}
+        print(f"--exclude-stems-file: dropped {n0 - len(audio_index)} validation file(s) "
+              f"from pretraining ({len(audio_index)} remain)")
+        if not audio_index:
+            raise SystemExit("All audio files were excluded -- nothing left to pretrain on")
+
+    train_stems, val_stems = split_files(audio_index, val_fraction=args.val_fraction, seed=args.seed)
+    print(f"Pretrain files: {len(train_stems)} | val files: {len(val_stems)}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # No labels at all -- same empty-annotation-table trick run_inference.py
+    # uses for pure inference, here so PamSequenceDataset's window-grid/
+    # audio-loading/noise-pool machinery can be reused as-is.
+    df_anno_empty = pd.DataFrame(columns=["file", "start_datetime", "end_datetime", "raw_label",
+                                           "source", "label", "stem", "t_1_s", "t_2_s"])
+    noise_pool_size = getattr(args, "noise_pool_size", NOISE_POOL_SIZE)
+    sim_cfg = dict(crop_min_sec=getattr(args, "simsiam_crop_min_sec", DEFAULT_SIMSIAM_CFG["crop_min_sec"]),
+                   noise_prob=getattr(args, "simsiam_noise_prob", DEFAULT_SIMSIAM_CFG["noise_prob"]),
+                   snr_db=tuple(getattr(args, "simsiam_snr_db", None) or DEFAULT_SIMSIAM_CFG["snr_db"]))
+    print(f"SimSiam views: {sim_cfg} (v12: crop_min_sec=0, noise_prob=0.5, snr_db=(6, 20))")
+    train_set = PamSequenceDataset(train_stems, audio_index, df_anno_empty, band="joint", augment=True,
+                                    bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None),
+                                    simsiam_pretrain=True, noise_pool_size=noise_pool_size, simsiam_cfg=sim_cfg)
+    val_set = PamSequenceDataset(val_stems, audio_index, df_anno_empty, band="joint", augment=True,
+                                  bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None),
+                                  simsiam_pretrain=True, noise_pool_size=noise_pool_size, simsiam_cfg=sim_cfg)
+
+    _worker_init = _worker_init_single_thread if args.num_workers > 0 else None
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
+                               num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                               worker_init_fn=_worker_init)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                             num_workers=args.num_workers, pin_memory=True,
+                             worker_init_fn=_worker_init)
+
+    pooled_freq_rows = BAND_CONFIG["joint"]["pooled_freq_rows"]
+    timesteps = timesteps_for_band("joint")
+    model = SimSiamPretrainModel(pooled_freq_rows=pooled_freq_rows, timesteps=timesteps,
+                                  proj_dim=args.proj_dim, pred_hidden=args.pred_hidden).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6
+    )
+    scaler = torch.amp.GradScaler("cuda") if (args.amp and device.type == "cuda") else None
+
+    log_file = os.path.join(args.output_dir, f"{args.run_name}.csv")
+    with open(log_file, mode="w", newline="") as f:
+        csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "lr", "z_std", "z_std_expected", "erank"])
+
+    config = dict(pooled_freq_rows=pooled_freq_rows, timesteps=timesteps,
+                   proj_dim=args.proj_dim, pred_hidden=args.pred_hidden, simsiam_views=sim_cfg)
+    z_expected = 1.0 / float(args.proj_dim) ** 0.5
+    best_val_loss = float("inf")
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for view1, view2 in tqdm(train_loader, desc=f"SimSiam epoch {epoch} train"):
+            view1, view2 = _to_device(view1, device), _to_device(view2, device)
+            optimizer.zero_grad()
+            if scaler is not None:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    p1, p2, z1, z2 = model(view1, view2)
+                    loss = simsiam_loss(p1, p2, z1, z2)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                p1, p2, z1, z2 = model(view1, view2)
+                loss = simsiam_loss(p1, p2, z1, z2)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            total_loss += loss.item()
+        train_loss = total_loss / len(train_loader)
+
+        model.eval()
+        total_val_loss = 0.0
+        zs = []
+        with torch.no_grad():
+            for view1, view2 in tqdm(val_loader, desc=f"SimSiam epoch {epoch} val"):
+                view1, view2 = _to_device(view1, device), _to_device(view2, device)
+                p1, p2, z1, z2 = model(view1, view2)
+                total_val_loss += simsiam_loss(p1, p2, z1, z2).item()
+                zs.append(F.normalize(z1.float(), dim=1).cpu())
+        val_loss = total_val_loss / len(val_loader)
+        # v13 collapse diagnostics on the validation embeddings (L2-normalised
+        # projections): z_std is the per-dimension std across samples --
+        # ~1/sqrt(proj_dim) when the embedding is spread out, -> 0 when it
+        # collapses to a constant; erank = exp(entropy of the normalised
+        # singular values) = how many dimensions are really used.
+        Z = torch.cat(zs, dim=0)
+        z_std = float(Z.std(dim=0).mean()) if len(Z) > 1 else float("nan")
+        try:
+            sv = torch.linalg.svdvals(Z - Z.mean(dim=0, keepdim=True))
+            pr = sv / sv.sum().clamp_min(1e-12)
+            erank = float(torch.exp(-(pr * torch.log(pr.clamp_min(1e-12))).sum()))
+        except Exception:
+            erank = float("nan")
+        if z_std < 0.1 * z_expected:
+            print(f"WARNING: embedding std {z_std:.4f} << expected ~{z_expected:.4f}: the SimSiam "
+                  f"representation looks COLLAPSED (loss near -1 is then meaningless)")
+
+        scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | lr={current_lr:.2e} "
+              f"| z_std={z_std:.4f} (expected ~{z_expected:.4f}) | erank={erank:.1f}/{args.proj_dim}")
+        with open(log_file, mode="a", newline="") as f:
+            csv.writer(f).writerow([epoch, train_loss, val_loss, current_lr, z_std, z_expected, erank])
+
+        checkpoint = dict(cnn_hf_state_dict=model.cnn_hf.state_dict(),
+                           cnn_lf_state_dict=model.cnn_lf.state_dict(),
+                           full_state_dict=model.state_dict(), epoch=epoch,
+                           val_loss=val_loss, config=config, z_std=z_std, erank=erank)
+        torch.save(checkpoint, os.path.join(args.output_dir, "latest_checkpoint.pth"))
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(checkpoint, os.path.join(args.output_dir, "best_cnn_towers.pth"))
+            print(f"Saved new best CNN towers, val_loss={best_val_loss:.4f}")
 
 
 def run_training(band: str, args):
@@ -2087,6 +2836,9 @@ def run_training(band: str, args):
     argparse.Namespace; see those scripts for the accepted fields."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Band: {band} | device: {device}")
+    if getattr(args, "class_config", None):
+        configure_classes(args.class_config)
+    print(f"Classes ({len(BAND_LABELS[band])}): {BAND_LABELS[band]}")
 
     audio_dirs = resolve_audio_dirs(args, band)
     df_anno, audio_index = build_dataset_table(
@@ -2096,8 +2848,11 @@ def run_training(band: str, args):
     )
     print(f"Found {len(audio_index)} audio files, {len(df_anno)} usable annotations")
     print(df_anno["label"].value_counts())
+    n_unc = int(df_anno["mask_label"].notna().sum()) if "mask_label" in df_anno.columns else 0
+    if n_unc:
+        print(f"{n_unc} 'uncertain' annotation rows -> their bins are masked for the class, not negatives")
 
-    train_stems, val_stems = split_files(audio_index, val_fraction=args.val_fraction, seed=args.seed)
+    train_stems, val_stems = get_split(args, audio_index, df_anno)
     print(f"Train files: {len(train_stems)} | Val files: {len(val_stems)}")
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -2106,15 +2861,25 @@ def run_training(band: str, args):
     with open(os.path.join(args.output_dir, "val_files.txt"), "w") as f:
         f.write("\n".join(val_stems))
 
+    # v13: what each class actually has to learn from / be scored on, per
+    # split (unique positive 0.5 s bins, scope-aware) -- also in the run log.
+    try:
+        _print_split_class_bins(df_anno, train_stems, val_stems, audio_index, BAND_LABELS[band])
+    except Exception as exc:  # never let a reporting helper kill a long job
+        print(f"(class/bin summary skipped: {exc!r})")
+
     bluefin_hf_dir = getattr(args, "bluefin_hf_dir", None)
     # v9: only meaningful for band="joint" -- PamSequenceDataset defaults
     # to "stack" (the v7/v8 behavior) when not band="joint", same as if
     # this were never passed.
     fusion_mode = getattr(args, "fusion_mode", "stack")
+    noise_pool_size = getattr(args, "noise_pool_size", NOISE_POOL_SIZE)
     train_set = PamSequenceDataset(train_stems, audio_index, df_anno, band=band, augment=True,
-                                    bluefin_hf_dir=bluefin_hf_dir, fusion_mode=fusion_mode)
+                                    bluefin_hf_dir=bluefin_hf_dir, fusion_mode=fusion_mode,
+                                    noise_pool_size=noise_pool_size, return_mask=True)
     val_set = PamSequenceDataset(val_stems, audio_index, df_anno, band=band, augment=False,
-                                  bluefin_hf_dir=bluefin_hf_dir, fusion_mode=fusion_mode)
+                                  bluefin_hf_dir=bluefin_hf_dir, fusion_mode=fusion_mode,
+                                  noise_pool_size=noise_pool_size, return_mask=True)
 
     label_list = BAND_LABELS[band]
     df_anno_train = df_anno[df_anno["stem"].isin(train_stems)]
@@ -2139,6 +2904,10 @@ def run_training(band: str, args):
     # class; background-only windows keep weight 1.0 so they're still seen,
     # just not as the overwhelming majority every epoch.
     sample_weights = 1.0 + train_set.class_presence.astype(np.float32) @ class_weights.numpy()
+    # v13: per-source draw multiplier (class_config.json -> sample_weight),
+    # e.g. keep the 17k-box DCLDE-CRP set from dominating every batch.
+    src_w = {s: CLASS_CFG.sample_weight(CLASS_CFG.source_of(s, audio_index.get(s))) for s in train_stems}
+    sample_weights = sample_weights * train_set.df_data["stem"].map(src_w).fillna(1.0).to_numpy(dtype=np.float32)
     sampler = torch.utils.data.WeightedRandomSampler(
         weights=sample_weights, num_samples=len(train_set), replacement=True
     )
@@ -2172,6 +2941,32 @@ def run_training(band: str, args):
         pooled_freq_rows=BAND_CONFIG[band].get("pooled_freq_rows", 32),
         fusion_mode=fusion_mode,
     ).to(device)
+
+    # v10: optionally load SimSiam-pretrained CNN tower weights (see
+    # run_simsiam_pretraining/pretrain_simsiam.py) before supervised
+    # training starts. Only meaningful for fusion_mode="twotower" --
+    # model.cnn_hf/model.cnn_lf only exist in that branch (see
+    # ImprovedCNNBiGRU.__init__). Checked explicitly for a clear message
+    # rather than a shape/attribute error three lines into the loop.
+    pretrained_cnn_path = getattr(args, "pretrained_cnn_towers", None)
+    if pretrained_cnn_path:
+        if fusion_mode != "twotower":
+            raise SystemExit("ERROR: --pretrained-cnn-towers only applies to fusion_mode='twotower' "
+                              "(it loads model.cnn_hf/model.cnn_lf, which only exist in that mode).")
+        pt_checkpoint = torch.load(pretrained_cnn_path, map_location=device, weights_only=False)
+        pt_config = pt_checkpoint.get("config", {})
+        expected = dict(pooled_freq_rows=BAND_CONFIG[band].get("pooled_freq_rows", 32),
+                         timesteps=timesteps_for_band(band))
+        mismatched = {k: (pt_config.get(k), v) for k, v in expected.items() if pt_config.get(k) != v}
+        if mismatched:
+            raise SystemExit(f"ERROR: {pretrained_cnn_path} was pretrained with a different CNN config "
+                              f"than this run's band/BAND_CONFIG -- (saved, requested): {mismatched}. "
+                              f"load_state_dict would fail on a shape mismatch anyway; match the "
+                              f"pretraining run's config or pretrain again with this one's.")
+        model.cnn_hf.load_state_dict(pt_checkpoint["cnn_hf_state_dict"])
+        model.cnn_lf.load_state_dict(pt_checkpoint["cnn_lf_state_dict"])
+        print(f"Loaded SimSiam-pretrained CNN towers from {pretrained_cnn_path} "
+              f"(pretrain val_loss={pt_checkpoint.get('val_loss')}, epoch={pt_checkpoint.get('epoch')})")
 
     criterion = WeightedCombinedLoss(class_weights=class_weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
@@ -2233,32 +3028,142 @@ def run_training(band: str, args):
         print(f"Resumed at epoch {epoch_start}, best_val_f1={best_val_f1:.4f}, "
               f"patience_counter={patience_counter}/{args.patience}")
 
+    # v12: --resume-add-classes -- a DIFFERENT operation from --resume
+    # above, not a variant of it: this warm-starts a NEW training phase
+    # (fresh optimizer/scheduler/epoch-count/best-val-f1/patience, since
+    # adding classes genuinely changes the loss landscape -- the old run's
+    # best_val_f1 isn't comparable to this one's) from an OLD checkpoint
+    # trained on a SUBSET of this run's current label_list. Mutually
+    # exclusive with --resume (which requires an IDENTICAL class set and
+    # continues the exact same training run, unchanged above).
+    #
+    # Mechanism: every parameter except the classifier's final Linear layer
+    # has a shape that depends only on hidden_size/gru_layers/
+    # pooled_freq_rows/use_attention -- NOT on num_classes -- so the whole
+    # CNN towers + BiGRU + attention load unchanged regardless of how many
+    # classes were added. Only the classifier's last Linear layer's output
+    # dimension actually depends on num_classes; its rows are copied over
+    # by NAME (not position), since a new class inserted in the MIDDLE of
+    # JOINT_LABELS (e.g. added to LF_LABELS) shifts every later class's
+    # index -- position-based copying would silently scramble which row
+    # means which class. New classes' rows are left at the classifier's
+    # own fresh random init (nothing to warm-start them from).
+    #
+    # Optimizer/scheduler state is NOT restored (unlike --resume) -- AdamW's
+    # per-parameter momentum/variance buffers are tied to the OLD
+    # classifier tensor's exact shape/identity, which no longer exists once
+    # that layer's output dimension changes; starting the new, larger
+    # classifier's optimizer state fresh is the standard, expected approach
+    # for incremental-class fine-tuning, not a shortcut taken here.
+    resume_add_classes_path = getattr(args, "resume_add_classes", None)
+    if resume_add_classes_path:
+        if resume_path:
+            raise SystemExit("ERROR: --resume and --resume-add-classes are mutually exclusive -- "
+                              "--resume continues an identical-architecture/identical-class-set run; "
+                              "--resume-add-classes starts a NEW training phase warm-started from an "
+                              "old, smaller class set.")
+        old_checkpoint = torch.load(resume_add_classes_path, map_location=device, weights_only=False)
+        if old_checkpoint.get("band") != band:
+            raise SystemExit(f"ERROR: {resume_add_classes_path} was trained as band="
+                              f"{old_checkpoint.get('band')!r}, this run is band={band!r} -- these are "
+                              f"different models.")
+        if old_checkpoint.get("fusion_mode", "stack") != fusion_mode:
+            raise SystemExit(f"ERROR: {resume_add_classes_path} was trained with fusion_mode="
+                              f"{old_checkpoint.get('fusion_mode', 'stack')!r}, this run uses "
+                              f"fusion_mode={fusion_mode!r} -- these are different architectures, not "
+                              f"just a class-set change.")
+        old_label_list = old_checkpoint.get("model_labels", [])
+        missing = [lb for lb in old_label_list if lb not in label_list]
+        if missing:
+            raise SystemExit(f"ERROR: {resume_add_classes_path}'s classes {missing} are not present in "
+                              f"this run's current label list ({label_list}) -- --resume-add-classes "
+                              f"only supports ADDING classes, not removing or renaming existing ones.")
+        new_classes = [lb for lb in label_list if lb not in old_label_list]
+        if not new_classes:
+            print(f"WARNING: {resume_add_classes_path}'s classes already match this run's label list "
+                  f"exactly -- nothing to add. Consider --resume instead if you meant to continue this "
+                  f"exact run.")
+        print(f"Expanding from {len(old_label_list)} to {len(label_list)} classes -- new: {new_classes}")
+
+        old_state = old_checkpoint["model_state_dict"]
+        new_state = model.state_dict()
+        # Shape-mismatched keys, derived rather than hardcoded (e.g.
+        # "classifier.4.*") so this keeps working if the classifier head's
+        # own internal structure ever changes -- anything whose shape
+        # differs between the old and new state dicts is, by construction,
+        # exactly the num_classes-dependent final layer and nothing else
+        # (every other parameter's shape is independent of num_classes).
+        mismatched_keys = {k for k in old_state if k in new_state and old_state[k].shape != new_state[k].shape}
+        compatible_state = {k: v for k, v in old_state.items() if k not in mismatched_keys}
+        missing_keys, unexpected_keys = model.load_state_dict(compatible_state, strict=False)
+        truly_missing = set(missing_keys) - mismatched_keys
+        if truly_missing or unexpected_keys:
+            raise SystemExit(f"ERROR: {resume_add_classes_path} isn't architecturally compatible beyond "
+                              f"the classifier's final layer -- missing {truly_missing}, unexpected "
+                              f"{unexpected_keys}. --resume-add-classes only handles a changed class "
+                              f"count, not other architecture differences (hidden_size, gru_layers, "
+                              f"pooled_freq_rows, use_attention, ...) -- those need --resume (identical "
+                              f"architecture) or training from scratch.")
+        if not mismatched_keys:
+            print("WARNING: no shape-mismatched classifier keys found -- old and new models may have "
+                  "the exact same num_classes already (see the 'nothing to add' warning above).")
+        else:
+            final_weight_key = next(k for k in mismatched_keys if k.endswith(".weight"))
+            final_bias_key = next(k for k in mismatched_keys if k.endswith(".bias"))
+            with torch.no_grad():
+                new_weight = new_state[final_weight_key]
+                new_bias = new_state[final_bias_key]
+                old_weight = old_state[final_weight_key]
+                old_bias = old_state[final_bias_key]
+                for old_idx, lb in enumerate(old_label_list):
+                    new_idx = label_list.index(lb)
+                    new_weight[new_idx].copy_(old_weight[old_idx])
+                    new_bias[new_idx].copy_(old_bias[old_idx])
+            model.load_state_dict(new_state)
+            print(f"Warm-started {len(old_label_list)}/{len(label_list)} classifier rows from "
+                  f"{resume_add_classes_path}; {len(new_classes)} new class row(s) left at random init. "
+                  f"Starting fresh optimizer/scheduler/epoch count (epoch 1) -- this is a new training "
+                  f"phase, not a continuation.")
+
+    # v13: selection metric = masked macro average precision over the classes
+    # with >= --min-val-positives positive bins in the validation split (see
+    # masked_class_metrics). F1@0.5 stays in the log for continuity with v12.
+    min_val_pos = getattr(args, "min_val_positives", MIN_VAL_POSITIVE_BINS)
     log_file = os.path.join(args.output_dir, f"{args.run_name}.csv")
     if not (resume_path and os.path.exists(log_file)):
         with open(log_file, mode="w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "train_loss", "train_f1", "val_loss", "val_f1", "lr"])
+            writer.writerow(["epoch", "train_loss", "train_f1", "val_loss", "val_f1", "val_macro_ap", "lr"]
+                            + [f"val_ap__{lb}" for lb in label_list] + [f"val_f1__{lb}" for lb in label_list])
 
     for epoch in range(epoch_start, args.epochs + 1):
-        train_loss, train_f1, _ = train_one_epoch(
+        tr = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
             num_classes=len(label_list), scaler=scaler,
         )
-        val_loss, val_f1, val_class_f1s = validate(model, val_loader, criterion, device,
-                                                     num_classes=len(label_list))
-        scheduler.step(val_f1)
+        va = validate(model, val_loader, criterion, device, num_classes=len(label_list), min_pos=min_val_pos)
+        train_loss, train_f1 = tr["loss"], tr["f1"]
+        val_loss, val_f1, val_ap = va["loss"], va["macro_f1"], va["macro_ap"]
+        val_class_f1s, val_class_ap = va["f1"], va["ap"]
+        # fall back to F1 only if NO class had enough validation positives for AP
+        val_score = val_ap if np.isfinite(np.array(val_class_ap)).any() else val_f1
+        scheduler.step(val_score)
         current_lr = optimizer.param_groups[0]["lr"]
 
         print(f"\nEpoch {epoch} | train_loss={train_loss:.4f} train_f1={train_f1:.4f} "
-              f"| val_loss={val_loss:.4f} val_f1={val_f1:.4f} | lr={current_lr:.2e}")
-        print("Val class F1s:", dict(zip(label_list, [round(f, 3) for f in val_class_f1s])))
+              f"| val_loss={val_loss:.4f} val_macro_AP={val_ap:.4f} (select) val_f1@0.5={val_f1:.4f} "
+              f"| lr={current_lr:.2e}")
+        print("Val class AP:", {lb: (None if np.isnan(a) else round(a, 3)) for lb, a in zip(label_list, val_class_ap)})
+        print("Val class F1@0.5:", dict(zip(label_list, [round(f, 3) for f in val_class_f1s])))
+        print("Val positive bins:", dict(zip(label_list, va["n_pos"])))
 
         with open(log_file, mode="a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([epoch, train_loss, train_f1, val_loss, val_f1, current_lr])
+            writer.writerow([epoch, train_loss, train_f1, val_loss, val_f1, val_ap, current_lr]
+                            + [("" if np.isnan(a) else a) for a in val_class_ap] + list(val_class_f1s))
 
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        if val_score > best_val_f1:
+            best_val_f1 = val_score
             patience_counter = 0
         else:
             patience_counter += 1
@@ -2277,24 +3182,35 @@ def run_training(band: str, args):
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
             "epoch": epoch,
+            # v13: "best_f1" kept as the key name every v12 script/resume path
+            # reads, but it now holds the SELECTION score (masked macro AP);
+            # selection_metric says so explicitly. val_f1_at_epoch is the old
+            # F1@0.5 of this epoch.
             "best_f1": best_val_f1,
+            "selection_metric": "masked_macro_average_precision",
+            "val_f1_at_epoch": val_f1,
+            "class_ap": val_class_ap,
+            "min_val_positive_bins": min_val_pos,
+            "class_config": CLASS_CFG.raw,
             "patience_counter": patience_counter,
             "class_f1s": val_class_f1s,
             "band": band,
-            "model_labels": label_list,
+            "model_labels": list(label_list),
             "band_config": BAND_CONFIG[band],
             "use_attention": args.use_attention,
             "rare_classes": rare_classes,
             "fusion_mode": fusion_mode,
+            "pretrained_cnn_towers": getattr(args, "pretrained_cnn_towers", None),
+            "resume_add_classes_from": getattr(args, "resume_add_classes", None),
         }
         torch.save(checkpoint_dict, os.path.join(args.output_dir, "latest_checkpoint.pth"))
 
         if patience_counter == 0:  # i.e. this epoch WAS the new best (see above)
             torch.save(checkpoint_dict, os.path.join(args.output_dir, "best_model.pth"))
-            print(f"Saved new best model, val_f1={best_val_f1:.4f}")
+            print(f"Saved new best model, val_macro_AP={best_val_f1:.4f}")
 
         if patience_counter >= args.patience:
             print(f"Early stopping after {args.patience} epochs without improvement")
             break
 
-    print(f"Training done. Best val F1: {best_val_f1:.4f}")
+    print(f"Training done. Best val macro AP: {best_val_f1:.4f}")

@@ -41,15 +41,15 @@ Run once per band (LF classes and HF classes need separate checkpoints).
 this script's scoring is continuous (run_inference_continuous, max-stitched
 across overlapping windows), and continuous scores run systematically
 higher than window ones, so a window-calibrated threshold applied here is
-measurably too permissive.
+measurably too permissive. See README's "v3 changes" #9/#11.
 
-Usage (SOMAD, the published joint model):
+Usage (nautilus, in Docker -- see run_nautilus_inference.sh):
 
-    python run_inference.py --band joint \
-        --checkpoint checkpoints/best_model.pth \
-        --thresholds-csv checkpoints/thresholds_joint_continuous.csv \
-        --audio-dir /path/to/your/wav/files \
-        --out scores_joint.nc
+    python run_inference.py --band lf \
+        --checkpoint /output/bigru_lf/best_model.pth \
+        --thresholds-csv /output/eval_lf/thresholds_lf_continuous.csv \
+        --audio-dir /data/hermine_SN8059_aplose_subset_2h \
+        --out /output/scores_lf.nc
 """
 
 import argparse
@@ -148,6 +148,10 @@ def main():
     if checkpoint.get("band", band) != band:
         print(f"WARNING: checkpoint was trained as band={checkpoint.get('band')!r}, "
               f"but --band={band!r} was requested")
+    # v13: evaluate with the class set the checkpoint was TRAINED with (matters once
+    # classes have been added to class_config.json after this checkpoint was made)
+    if checkpoint.get('class_config'):
+        common.configure_classes(checkpoint['class_config'])
     label_list = checkpoint.get("model_labels", common.BAND_LABELS[band])
     band_config = checkpoint.get("band_config", common.BAND_CONFIG[band])
     use_attention = checkpoint.get("use_attention", False)

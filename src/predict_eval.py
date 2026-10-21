@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Evaluate a trained checkpoint (LF, HF, or joint) on its validation
-split: runs inference over the val set, finds the best-F1 decision
-threshold per class from a precision/recall curve, and saves plots + a
-thresholds CSV.
+"""Evaluate a trained LF or HF BiGRU checkpoint on its validation split:
+runs inference over the val set, finds the best-F1 decision threshold per
+class from a precision/recall curve, and saves plots + a thresholds CSV.
 
-Thresholds are calibrated two ways and both are reported -- see the
-"window" vs "continuous" note in main() for why; always use the
-*continuous* one downstream (that's what `checkpoints/
-thresholds_joint_continuous.csv` and `run_inference.py` expect).
+v3: calibrates thresholds TWO ways and reports both, rather than silently
+picking one -- see the "window" vs "continuous" note in main() for why.
 
-Usage:
+Usage (nautilus, v2 output tree -- see README.md):
 
-    python predict_eval.py --band joint --checkpoint checkpoints/best_model.pth
+    python predict_eval.py --band lf --checkpoint /scratch/disk3/a5278/bigru_aplose/output_v5/bigru_lf/best_model.pth
+    python predict_eval.py --band hf --checkpoint /scratch/disk3/a5278/bigru_aplose/output_v5/bigru_hf/best_model.pth \
+        --output-dir /scratch/disk3/a5278/bigru_aplose/output_v5/eval_hf
 
-If running this inside Docker, pass `--shm-size=16g` (or larger) to
-`docker run` -- the default container shared-memory size is too small for
-the DataLoader workers and fails with a misleading "No space left on
-device".
+Prefer `./run_nautilus_eval.sh {lf|hf}` over calling this directly --
+it sets `--shm-size=16g`, which this needs when run in Docker (the default
+container shm is too small for the DataLoader workers and fails with a
+misleading "No space left on device").
 """
 
 import argparse
@@ -171,7 +170,7 @@ def main():
         with open(val_files_path) as f:
             val_stems = [l.strip() for l in f if l.strip()]
     else:
-        _, val_stems = common.split_files(audio_index, val_fraction=args.val_fraction, seed=args.seed)
+        _, val_stems = common.get_split(args, audio_index, df_anno)
 
     if args.exclude_bluefin:
         n_before = len(val_stems)
@@ -192,6 +191,10 @@ def main():
     if checkpoint.get("band", band) != band:
         print(f"WARNING: checkpoint was trained as band={checkpoint.get('band')!r}, "
               f"but --band={band!r} was requested")
+    # v13: evaluate with the class set the checkpoint was TRAINED with (matters once
+    # classes have been added to class_config.json after this checkpoint was made)
+    if checkpoint.get('class_config'):
+        common.configure_classes(checkpoint['class_config'])
     label_list = checkpoint.get("model_labels", common.BAND_LABELS[band])
     band_config = checkpoint.get("band_config", common.BAND_CONFIG[band])
     use_attention = checkpoint.get("use_attention", False)

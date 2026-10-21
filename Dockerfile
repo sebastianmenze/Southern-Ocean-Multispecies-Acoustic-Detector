@@ -28,6 +28,10 @@ RUN pip install --no-cache-dir \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY src/*.py ./
+# v13: common.py now loads class_config.py's class/data-source definition
+# from this JSON file at runtime (not a .py file, so the wildcard above
+# doesn't pick it up).
+COPY src/class_config.json ./
 
 # /data holds the audio + annotation CSVs, /output holds checkpoints/logs,
 # /checkpoints holds the released SOMAD checkpoint + calibrated thresholds
