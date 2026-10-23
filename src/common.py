@@ -1,36 +1,20 @@
 # -*- coding: utf-8 -*-
-"""Shared data pipeline, model and loss code for the BiGRU sequence-tagger
-classifiers (LF = low-frequency baleen whale calls, HF = higher-frequency
-species), trained on the combined APLOSE (Gerlache/hermine) + SOI/AURAL 2024
-annotation sets -- the same two annotation sources the Perch classifier in
-``aplose_training/perch_training*`` is built from (see ``train_perchv2.txt``).
+"""SOMAD v17: shared data pipeline, model and loss code for the CNN-BiGRU
+sequence tagger that scores all classes (class_config.json) at once from
+60 s windows of 32 kHz audio.
 
-Label set is aligned with the Perch model's canonical species names
-(see ``perch_training/label_map*.json``), split into two bands:
+v17 input: ONE variable-Q CQT spectrogram (11 octaves x 24 bins/octave,
+7.8 Hz - 16 kHz, gamma 3 Hz), resized to 500 freq x 600 time bins, through
+ONE CNN tower. It replaces v13's two sub-band spectrograms (mel 32 kHz + linear
+500 Hz) and two CNN towers, and v13's separate lf/hf/joint bands, fusion modes
+and SimSiam tower pretraining (use the v13 code for those). The spectrogram is
+computed inside the model (CQTFrontend) on the GPU; the DataLoader only
+decodes audio and applies waveform augmentation. See CHANGES_v17.md.
 
-  LF band (audio resampled to a few hundred Hz; Perch's own frontend can't
-  resolve energy below ~70-150 Hz -- see perch_training_wideband/perch_common.py):
-    Fin whale 20 Hz, Fin whale downsweep,
-    Blue whale AB call, Blue whale D call, Blue whale Z call,
-    Minke whale
-    (v5: Blue whale A call and B call are merged into one "AB call" label --
-    B call alone was a single occurrence in the original Gerlache/hermine
-    data, nowhere near enough to train separately, and both are part of the
-    same stereotyped call sequence anyway. Blue whale Z call and Minke
-    whale are new, sourced entirely from convert_bluefin_library.py's
-    AcousticTrends_BlueFinLibrary conversion, not the original Gerlache/
-    hermine APLOSE export -- see README's "v5 changes")
-
-  HF band (audio kept near its native 32 kHz rate):
-    Humpback, Leopard seal, Weddell seal, Crabeater seal, Orca
-
-Perch's "Background" class is a hand-picked ambient-noise clip category and
-is deliberately NOT reproduced as an explicit output here: these models are
-multi-label sequence taggers over continuous recordings, and the vast
-majority of each recording is unannotated audio anyway, so "no species
-active" already serves as the implicit background/negative case (this is
-also how the original claude_18_hf / claude_19_lf models in
-``nn_bigru_classifier`` worked).
+Classes keep v13's two blocks (class_config.json "band": lf / hf) only as an
+ordering convention: LF classes first, then HF classes, all scored jointly.
+Perch's "Background" class is deliberately not reproduced: "no class active"
+is the implicit negative of these multi-label sequence taggers.
 """
 
 import csv
@@ -50,7 +34,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
-import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -81,59 +64,13 @@ def _save_audio(path: str, waveform: torch.Tensor, sr: int):
     sf.write(path, data, sr)
 
 
-# --------------------------------------------------------------------------
-# v9: fusion-mode helpers for band="joint" -- see train_lf.py's --fusion-mode
-# comment for the full reasoning behind each mode.
-# --------------------------------------------------------------------------
-def _minmax_norm(spec: torch.Tensor) -> torch.Tensor:
-    return (spec - spec.min()) / (spec.max() - spec.min() + 1e-12)
-
-
-def _resize_freq(spec: torch.Tensor, target_freq_bins: int) -> torch.Tensor:
-    """Resize a (channels, freq_bins, time_bins) spec to a different
-    freq_bins, leaving time_bins untouched. No-op if already that size."""
-    if spec.shape[1] == target_freq_bins:
-        return spec
-    return transforms.Resize((target_freq_bins, spec.shape[2]))(spec)
-
-
 def _to_device(x, device):
-    """Like Tensor.to(device), but also handles the dict-of-tensors batch
-    shape --fusion-mode=twotower produces (PamSequenceDataset.__getitem__
-    returns {"hf": ..., "lf": ...} instead of one tensor for that mode, and
-    the default DataLoader collate_fn turns a batch of those dicts into one
-    dict of batched tensors)."""
+    """Tensor.to(device), also for the {"wave", "aug"} dict batches
+    PamSequenceDataset returns (the default collate_fn turns a batch of dicts
+    into one dict of batched tensors)."""
     if isinstance(x, dict):
         return {k: v.to(device, non_blocking=True) for k, v in x.items()}
     return x.to(device, non_blocking=True)
-
-
-def _apply_specaugment(spec: torch.Tensor, freq_bins: int, time_bins: int, cfg: dict, n_augment: int) -> torch.Tensor:
-    """SpecAugment (stripe dropout) on one (channels, freq_bins, time_bins)
-    tensor -- extracted so --fusion-mode=channels/twotower can apply it per
-    sub-band (each with its own freq_bins) instead of only against the
-    single combined spec_dim the original inline version assumed."""
-    if n_augment <= 0 or not cfg.get("spec_augment", True):
-        return spec
-    stripes_ver = stripes_hor = 0
-    for _ in range(n_augment):
-        if torch.randint(low=0, high=2, size=(1,))[0] == 0:
-            stripes_ver += 1
-        else:
-            stripes_hor += 1
-
-    drop_ver = int(time_bins * cfg["max_time_mask_frac"])
-    drop_hor = int(freq_bins * cfg["max_freq_mask_frac"])
-
-    for _ in range(stripes_ver):
-        distance = torch.randint(low=0, high=max(drop_ver, 1), size=(1,))[0]
-        bgn = torch.randint(low=0, high=time_bins - distance, size=(1,))[0]
-        spec[:, :, bgn:bgn + distance] = 0
-    for _ in range(stripes_hor):
-        distance = torch.randint(low=0, high=max(drop_hor, 1), size=(1,))[0]
-        bgn = torch.randint(low=0, high=freq_bins - distance, size=(1,))[0]
-        spec[:, bgn:bgn + distance, :] = 0
-    return spec
 
 
 # --------------------------------------------------------------------------
@@ -205,21 +142,12 @@ HF_LABELS = [
     "Orca",
 ]
 
-# v7: for the new joint LF+HF model (band="joint", see BAND_CONFIG["joint"]
-# below and train_joint.py) -- the union of LF_LABELS/HF_LABELS, ONE shared
-# output per class instead of v6's approach (train Humpback/Leopard/
-# Weddell/Crabeater independently on both bands, two separate decisions per
-# class). A joint spectrogram lets the model see both bands' evidence for
-# the same class at once, which is strictly more informative than
-# reconciling two independent per-band predictions after the fact -- see
-# README's "v7 changes" for the full reasoning behind building this at all.
-# LF_LABELS/HF_LABELS above are reverted to their original v5 six/five (v6's
-# cross-band duplication was v6-specific, superseded here) so train_lf.py/
-# train_hf.py still work unchanged from this same v7 checkout if you want
-# the old separate-band models for comparison.
-JOINT_LABELS = LF_LABELS + HF_LABELS  # 6 + 5 = 11, no overlap now that LF_LABELS is back to v5's six
+# All classes, LF block first -- the model's output order.
+JOINT_LABELS = LF_LABELS + HF_LABELS
 
-BAND_LABELS = {"lf": LF_LABELS, "hf": HF_LABELS, "joint": JOINT_LABELS}
+# One band, "cqt", scoring every class (same list object as JOINT_LABELS, so
+# configure_classes' in-place update reaches it too).
+BAND_LABELS = {"cqt": JOINT_LABELS}
 
 # --------------------------------------------------------------------------
 # Raw annotation label -> canonical label maps, one per source dataset.
@@ -292,125 +220,82 @@ SOI_LABEL_MAP = {
 }
 
 # --------------------------------------------------------------------------
-# Per-band audio / spectrogram / windowing configuration.
-# LF settings match the old claude_19_lf model; HF settings match the old
-# claude_18_hf model (see nn_bigru_classifier/train_pam_naut_19_lf.py and
-# apply_to_all_data_cnn_18hf_nautilus.py).
+# v13: classes, label maps and per-source scope now come from
+# class_config.json (see class_config.py). The literal lists/maps above are
+# only the v12 defaults the config is mutated INTO, in place -- every
+# existing reference (BAND_LABELS, the dataset, scripts that import
+# common.JOINT_LABELS...) keeps pointing at the same list/dict objects.
+# Adding a class later = edit class_config.json, no code change here.
+# --------------------------------------------------------------------------
+import class_config as _class_config
+
+UNCERTAIN_LABEL_MAP = {}   # raw label -> class whose bins get MASKED (not negative, not positive)
+CLASS_CFG = None
+
+
+def configure_classes(path_or_dict=None):
+    """(Re)load the class/source config and update LF/HF/JOINT_LABELS and the
+    label maps in place. Called once at import with the shipped
+    class_config.json (or $SOMAD_CLASS_CONFIG); call again with a path/dict
+    to switch (somad_args.resolve_defaults does, for --class-config)."""
+    global CLASS_CFG
+    cfg = _class_config.load_class_config(path_or_dict)
+    LF_LABELS[:] = cfg.lf_labels
+    HF_LABELS[:] = cfg.hf_labels
+    JOINT_LABELS[:] = LF_LABELS + HF_LABELS
+    APLOSE_LABEL_MAP.clear()
+    APLOSE_LABEL_MAP.update(cfg.aplose_map)
+    SOI_LABEL_MAP.clear()
+    SOI_LABEL_MAP.update(cfg.soi_map)
+    UNCERTAIN_LABEL_MAP.clear()
+    UNCERTAIN_LABEL_MAP.update(cfg.uncertain_map)
+    CLASS_CFG = cfg
+    return cfg
+
+
+configure_classes()
+
+# --------------------------------------------------------------------------
+# Audio / spectrogram / windowing configuration (one band: "cqt").
 # --------------------------------------------------------------------------
 
-BAND_CONFIG = {
-    "lf": dict(
-        sample_rate=500,
-        # v7: fft_size 2**9->2**8 (512->256 samples, ~1.02s->~0.51s window).
-        # fft_overlap briefly tried at 0.9, reverted back to 0.1 -- note
-        # what this field actually controls (hop_length = fft_size *
-        # fft_overlap, see _compute_spectrogram): despite the name, a
-        # BIGGER value means a BIGGER hop, i.e. LESS real overlap between
-        # consecutive STFT frames. At 0.1 (here), hop=25.6 samples -> ~90%
-        # real overlap between windows.
-        fft_size=2 ** 8,
-        fft_overlap=0.1,
-        n_mels=None,          # linear spectrogram
-        f_min=None,
-        f_max=None,
-        freq_bins=200,
-        time_bins=600,
-        snippet_length_s=60,
-        snippet_overlap=2,    # 2 = 50% hop between snippet starts
-        label_interval_s=0.5,
-        # v2: LF and HF used to share identical capacity (hidden_size=512,
-        # 3 GRU layers) despite LF's input being far lower-information --
-        # 500 Hz sample rate, 200 freq bins, effectively content under
-        # ~250 Hz. The v1 run massively overfit on LF (train F1 -> 0.89,
-        # val F1 stuck ~0.47 from epoch ~25 on): cut GRU capacity hard here.
-        hidden_size=192,
-        gru_layers=2,
-        # v3: SpecAugment (zeroing out random time/freq stripes) dropped
-        # for LF entirely. Real recordings never contain literal zeroed-out
-        # blocks -- it's an out-of-distribution artifact, and LF calls are
-        # narrow/short enough (a fin whale 20 Hz pulse is ~1s) that a mask
-        # can erase one outright rather than just partially occluding it.
-        # Waveform-level augmentation (augment_waveform: gain + noise, both
-        # of which real recordings *do* look like) stays on.
-        spec_augment=False,
-    ),
-    "hf": dict(
-        sample_rate=32000,
-        fft_size=2 ** 13,
-        fft_overlap=0.1,
-        n_mels=700,
-        f_min=10,
-        f_max=16000,
-        freq_bins=500,
-        time_bins=600,
-        snippet_length_s=60,
-        snippet_overlap=2,
-        label_interval_s=0.5,
-        hidden_size=512,
-        gru_layers=3,
-        # Kept on for HF for now (only asked to drop it for LF). HF calls
-        # (humpback song bouts, seal/orca calls) run longer, so a mask is
-        # less likely to erase one outright than for LF's short pulses.
-        spec_augment=True,
-        max_time_mask_frac=0.10,   # 600*0.10 = 60 bins -> up to ~6s
-        max_freq_mask_frac=0.10,   # 500*0.10 = 50 bins
-    ),
-}
-
-# v7: the joint LF+HF model's config -- NOT a third independent band, a
-# combination of the two existing ones above (added after BAND_CONFIG's own
-# literal closes so "hf"/"lf" can be referenced directly instead of
-# duplicating their fft/mel parameters a third time). Every window's input
-# is built from the SAME source audio decoded/resampled TWICE -- once per
-# sub_bands entry, through the exact same per-band spectrogram math
-# BAND_CONFIG["hf"]/["lf"] already use for the standalone models -- then the
-# two resulting (own freq_bins, time_bins) spectrograms are stacked along
-# the frequency axis, HF on top of LF (matches how a real spectrogram reads
-# top-to-bottom: HF's ~16 kHz ceiling above, LF's ~250 Hz ceiling below),
-# giving one (hf freq_bins + lf freq_bins, time_bins) image -- computed
-# below from BAND_CONFIG["hf"]/["lf"]'s own current values directly, not
-# hardcoded, so it always stays correct if either changes.
-BAND_CONFIG["joint"] = dict(
-    sub_bands=dict(hf=BAND_CONFIG["hf"], lf=BAND_CONFIG["lf"]),
-    freq_bins=BAND_CONFIG["hf"]["freq_bins"] + BAND_CONFIG["lf"]["freq_bins"],
+# v17: ONE variable-Q CQT spectrogram of the full 32 kHz band as the model
+# input, through a single CNN tower, replacing v13's two sub-band
+# spectrograms (mel HF + linear LF) and two towers (and v13's lf/hf/joint
+# bands). The spectrogram is NOT computed in the DataLoader:
+# PamSequenceDataset returns the raw (padded) window waveform, and
+# ImprovedCNNBiGRU's CQTFrontend
+# computes CQT -> power-pool to time_bins -> log10 -> resize to freq_bins ->
+# per-window min-max -> SpecAugment on the model's device (GPU). 11 octaves x
+# 24 bins/octave at 32 kHz = 264 log-spaced bins from 7.8 Hz to 16 kHz;
+# gamma = 3 Hz widens every band by 3 Hz (variable-Q, as librosa.vqt), which
+# only matters for the low bins: ~0.24 s window at 20 Hz instead of ~0.9 s
+# for a plain CQT, so fin whale 20 Hz pulses keep their downsweep shape.
+BAND_CONFIG = {"cqt": dict(
+    sample_rate=32000,
+    cqt_octaves=11,
+    cqt_bins_per_octave=24,
+    cqt_gamma_hz=3.0,
+    # seconds of real audio (or zeros at a file edge) on each side of the 60 s
+    # window inside the one CQT block: the transform is circular, so wrap-
+    # around and the low bins' long windows only touch this padding, which
+    # is cropped off before pooling. Must equal PamSequenceDataset.WINDOW_LOAD_PAD_S.
+    cqt_pad_s=2.0,
+    # windows per CQT call inside CQTFrontend (GPU memory: ~0.5 GB per window
+    # at these settings, freed after each chunk)
+    cqt_chunk=4,
+    freq_bins=500,
     time_bins=600,
     snippet_length_s=60,
     snippet_overlap=2,
     label_interval_s=0.5,
-    # >= HF's capacity (512/3), not LF's (192/2) -- the joint input carries
-    # strictly more information than either band alone (both bands' full
-    # content, for a class list that's now the union of both), so there's
-    # no reason to under-provision it the way LF's small model was
-    # deliberately sized for a low-information 200-bin input alone (see
-    # "lf" config's own v2 comment above). Not pushed higher than this
-    # without real evidence it helps -- see README's "v7 changes".
     hidden_size=512,
     gru_layers=3,
-    # ImprovedCNNBiGRU's AdaptiveAvgPool2d((pooled_freq_rows, timesteps))
-    # stage -- 32 in the existing lf/hf models regardless of their own
-    # freq_bins (200 or 500), since that pooling already absorbs whatever
-    # height the CNN's feature maps come in at. Bumped up here since a
-    # joint (200+500=700-row) input is now carrying TWO bands' worth of
-    # frequency detail into that same bottleneck; leaving it at 32 risked blurring
-    # HF-half and LF-half detail together too aggressively. Not a required
-    # architecture change (the model runs fine at 32 too), just a capacity
-    # increase matched to the larger, more diverse input -- see
-    # ImprovedCNNBiGRU's own pooled_freq_rows parameter.
     pooled_freq_rows=48,
     spec_augment=True,
     max_time_mask_frac=0.10,
     max_freq_mask_frac=0.10,
-    # v9: only used by --fusion-mode=channels (see train_lf.py's own
-    # comment for the full reasoning) -- the shared frequency resolution
-    # BOTH sub-bands get resized to before being stacked as 2 input
-    # channels instead of extra frequency rows. Set to HF's own native 500
-    # (was 256) so HF is never downsampled/loses resolution; LF (native
-    # 200) gets upsampled 2.5x to match instead -- LF's real content is
-    # concentrated under ~250 Hz anyway (see BAND_CONFIG["lf"]'s own
-    # comments), so upsampling it via Resize (bilinear interpolation, no
-    # new information) is a smaller cost than throwing away real HF detail.
-    channels_freq_bins=500,
-)
+)}
 
 
 def timesteps_for_band(band: str) -> int:
@@ -524,10 +409,16 @@ def load_aplose_annotations(csv_path: str) -> pd.DataFrame:
         "end_datetime": pd.to_datetime(df["end_datetime"], utc=True),
         "raw_label": df["annotation"],
         "source": "aplose",
+        "dataset": df["dataset"].astype(str) if "dataset" in df.columns else "aplose",
         "weak": df.get("type", pd.Series("BOX", index=df.index)).eq("WEAK"),
     })
     out["label"] = out["raw_label"].map(APLOSE_LABEL_MAP)
-    out = out.dropna(subset=["label"]).reset_index(drop=True)
+    # v13: "uncertain" raw labels (class_config.json -> uncertain_labels) keep
+    # a row with label=NaN and mask_label=<class>: never a positive, but the
+    # dataset masks those bins out of that class's loss instead of treating
+    # them as confirmed background.
+    out["mask_label"] = out["raw_label"].map(UNCERTAIN_LABEL_MAP)
+    out = out[out["label"].notna() | out["mask_label"].notna()].reset_index(drop=True)
 
     n_weak = int(out["weak"].sum())
     if n_weak:
@@ -539,17 +430,33 @@ def load_aplose_annotations(csv_path: str) -> pd.DataFrame:
 
 def load_soi_annotations(csv_path: str) -> pd.DataFrame:
     """Load the SOI/AURAL annotation CSV (t1/t2/label/audiofilename) into the
-    common schema."""
+    common schema. v13: also accepts an APLOSE-format export of the same
+    annotations (filename/start_datetime/end_datetime/annotation columns),
+    mapped with the SOI label map."""
     df = pd.read_csv(csv_path)
-    out = pd.DataFrame({
-        "file": df["audiofilename"].apply(os.path.basename),
-        "start_datetime": pd.to_datetime(df["t1"], utc=True),
-        "end_datetime": pd.to_datetime(df["t2"], utc=True),
-        "raw_label": df["label"],
-        "source": "soi",
-    })
+    if "audiofilename" not in df.columns and {"filename", "annotation", "start_datetime"} <= set(df.columns):
+        out = pd.DataFrame({
+            "file": df["filename"].astype(str).apply(os.path.basename),
+            "start_datetime": pd.to_datetime(df["start_datetime"], utc=True),
+            "end_datetime": pd.to_datetime(df["end_datetime"], utc=True),
+            "raw_label": df["annotation"],
+            "source": "soi",
+            "dataset": df["dataset"].astype(str) if "dataset" in df.columns else "soi",
+        })
+        weak = df.get("type", pd.Series("BOX", index=df.index)).eq("WEAK").to_numpy()
+        out = out[~weak]
+    else:
+        out = pd.DataFrame({
+            "file": df["audiofilename"].apply(os.path.basename),
+            "start_datetime": pd.to_datetime(df["t1"], utc=True),
+            "end_datetime": pd.to_datetime(df["t2"], utc=True),
+            "raw_label": df["label"],
+            "source": "soi",
+            "dataset": "soi",
+        })
     out["label"] = out["raw_label"].map(SOI_LABEL_MAP)
-    return out.dropna(subset=["label"]).reset_index(drop=True)
+    out["mask_label"] = out["raw_label"].map(UNCERTAIN_LABEL_MAP)
+    return out[out["label"].notna() | out["mask_label"].notna()].reset_index(drop=True)
 
 
 def build_audio_index(audio_dirs) -> dict:
@@ -562,26 +469,13 @@ def build_audio_index(audio_dirs) -> dict:
 
 
 def resolve_audio_dirs(args, band: str) -> list:
-    """hermine/soi dirs apply to both bands; args.bluefin_dir (v5+: the
-    AcousticTrends_BlueFinLibrary conversion, resampled to exactly 500 Hz
-    -- the LF model's own working rate, see convert_bluefin_library.py) is
-    LF-only. Its content has no real energy above a couple hundred Hz
-    (bandlimited by the original recorders, some as low as 250 Hz natively
-    -- see that script's docstring), so every window would be a
-    guaranteed-background negative for every HF class (seals, orca,
-    humpback all need much higher frequencies); including it in HF
-    training/eval would only add wasted decode/spectrogram time with no
-    benefit. `args.bluefin_dir` may not exist on older (v4 and earlier)
-    argparsers -- getattr default keeps this call safe either way.
-
-    v7: band=="joint" also includes bluefin_dir, same as "lf" -- a joint
-    window still needs SOME audio for its HF half even over a bluefin-
-    sourced file (see _spectrogram_for_subband's shaped-dither handling for
-    why that's not just silence/a hard edge), and the joint model still
-    wants bluefin's real LF-band content for its LF half regardless."""
-    dirs = [args.hermine_dir, args.soi_train_dir, args.soi_val_dir]
-    if band in ("lf", "joint"):
-        dirs.append(getattr(args, "bluefin_dir", None))
+    """Audio folders to index: hermine/soi, the BlueFin library conversion
+    (args.bluefin_dir, 500 Hz audio -- upsampled to 32 kHz with shaped dither
+    on load, or read from --bluefin-hf-dir's precomputed 32 kHz copy) and any
+    --extra-audio-dir (v13: e.g. DCLDE, SRW). `band` is kept for the call
+    signature; v17 has only "cqt", which needs all of them."""
+    dirs = [args.hermine_dir, args.soi_train_dir, args.soi_val_dir, getattr(args, "bluefin_dir", None)]
+    dirs.extend(getattr(args, "extra_audio_dir", None) or [])   # v13: e.g. the DCLDE folder
     return [d for d in dirs if d]
 
 
@@ -591,13 +485,12 @@ def filter_bluefin_sites(audio_index: dict, bluefin_dir: str, sites) -> dict:
     matching convert_bluefin_library.py's own SITES keys exactly, since
     that script's output filenames always embed the site name) -- lets
     training restrict bluefin_library to a subset of its 11 site-years
-    (e.g. train_joint.py's own default) without touching hermine/soi stems.
+    (--bluefin-sites) without touching hermine/soi stems.
     Identified by directory (bluefin_dir is one flat folder, see
     convert_bluefin_library.py's docstring), not by name pattern, so this
     can't accidentally misclassify a hermine/soi stem. No-op if `sites` is
-    falsy (every bluefin site stays -- current default behavior for
-    train_lf.py/train_hf.py) or bluefin_dir wasn't actually resolved (band
-    doesn't use it at all)."""
+    falsy (every bluefin site stays -- the default) or bluefin_dir wasn't
+    resolved."""
     if not sites or not bluefin_dir:
         return audio_index
     bluefin_dir_norm = os.path.normpath(bluefin_dir)
@@ -629,8 +522,7 @@ def build_dataset_table(aplose_csv, soi_csv: str, audio_dirs, bluefin_dir: str =
     `bluefin_dir`/`bluefin_sites` (v7, both optional, default None = no
     filtering, backward compatible with every existing caller) restrict
     bluefin_library to a subset of its site-years via filter_bluefin_sites
-    -- see train_joint.py's own default and --bluefin-sites in
-    build_argparser.
+    -- see --bluefin-sites in somad_args.build_argparser.
 
     Returns (df_anno, audio_index) where df_anno has columns
     [file, label, source, t_1_s, t_2_s] and audio_index maps
@@ -670,22 +562,205 @@ def build_dataset_table(aplose_csv, soi_csv: str, audio_dirs, bluefin_dir: str =
     df_anno = df_anno[plausible].reset_index(drop=True)
     assert len(df_anno) == n_before - len(dropped)
 
+    df_anno = drop_out_of_scope_annotations(df_anno, audio_index)
     return df_anno, audio_index
 
 
-def split_files(audio_index: dict, val_fraction: float = 0.15, seed: int = 0):
-    """Deterministic file-level train/val split (no clip ever leaks across
-    the split), stratified by source (aplose vs soi) so validation has
-    representation from both recording sites."""
+def drop_out_of_scope_annotations(df_anno: pd.DataFrame, audio_index: dict) -> pd.DataFrame:
+    """v13: remove annotation rows whose class is outside the scope of the
+    file's source (class_config.json -> annotated_classes / annotated_in).
+    Masking alone zeroes their loss, but they would still count as positives
+    in the rare-class sampler, class weights and bin tables; dropping them
+    makes all of those consistent (e.g. Kerguelen's D-call/downsweep rows)."""
+    if df_anno is None or df_anno.empty or "label" not in df_anno.columns:
+        return df_anno
+    labels = list(JOINT_LABELS)
+    li = {lb: i for i, lb in enumerate(labels)}
+    scope = stem_scope_matrix(df_anno["stem"].unique(), audio_index, labels)
+    keep = [
+        (lb not in li) or bool(scope[st][li[lb]]) if isinstance(lb, str) else True
+        for st, lb in zip(df_anno["stem"].tolist(), df_anno["label"].tolist())
+    ]
+    keep = np.array(keep, dtype=bool)
+    n_drop = int((~keep).sum())
+    if n_drop:
+        d = df_anno.loc[~keep]
+        print(f"Dropping {n_drop} annotation rows of classes outside their source's scope: "
+              f"{d.groupby(['label']).size().to_dict()}")
+    return df_anno[keep].reset_index(drop=True)
+
+
+def stem_sources(audio_index: dict) -> dict:
+    """v13: stem -> source name (class_config.json stem rules, else the
+    audio folder's name)."""
+    return {s: CLASS_CFG.source_of(s, p) for s, p in audio_index.items()}
+
+
+def stem_scope_matrix(stems, audio_index: dict, label_list) -> dict:
+    """v13: stem -> bool array (len(label_list)): was this class actually
+    annotated for this file's source? False = masked out of loss/metrics."""
+    cache, out = {}, {}
+    for s in stems:
+        src = CLASS_CFG.source_of(s, audio_index.get(s))
+        if src not in cache:
+            cache[src] = np.array(CLASS_CFG.scope(src, label_list), dtype=bool)
+        out[s] = cache[src]
+    return out
+
+
+def split_files(audio_index: dict, val_fraction: float = 0.30, seed: int = 0,
+                df_anno: pd.DataFrame = None, verbose: bool = True):
+    """v13 deterministic file-level train/val split (no clip ever leaks
+    across the split).
+
+    Roles come from class_config.json -> sources[*].split:
+      train_only  -- never in validation (e.g. the DCLDE Pacific orca data)
+      val_only    -- never in training
+      random      -- eligible for the random val_fraction draw
+    plus, for random sources, `val_only_classes` (Southern Ocean Orca): any
+    FILE containing an annotation of such a class is forced into
+    validation, so those annotations can never reach training.
+
+    val_fraction is a fraction of the random-eligible files (random-source
+    files incl. the forced ones): forced files count toward it, the rest of
+    the quota is drawn stratified by source. With df_anno=None no file can be
+    forced (callers that need the real split must pass df_anno)."""
     from sklearn.model_selection import train_test_split
 
     stems = sorted(audio_index.keys())
-    sources = ["aplose" if s.startswith("hermine") else "soi" for s in stems]
+    src = stem_sources(audio_index)
+    role = {s: CLASS_CFG.split_role(src[s]) for s in stems}
 
-    train_stems, val_stems = train_test_split(
-        stems, test_size=val_fraction, random_state=seed, stratify=sources
-    )
-    return sorted(train_stems), sorted(val_stems)
+    forced = set()
+    if df_anno is not None and len(df_anno):
+        d = df_anno[df_anno["stem"].isin(src.keys()) & df_anno["label"].notna()]
+        for source in sorted({src[s] for s in d["stem"].unique()}):
+            vo = CLASS_CFG.val_only_classes(source)
+            if not vo:
+                continue
+            ss = d[d["stem"].map(src) == source]
+            forced |= set(ss.loc[ss["label"].isin(vo), "stem"])
+    conflict = [s for s in forced if role[s] != "random"]
+    if conflict and verbose:
+        print(f"WARNING: {len(conflict)} file(s) hold val-only-class annotations but their source's split "
+              f"role is not 'random' -- split role wins: {conflict[:5]}")
+    forced = {s for s in forced if role[s] == "random"}
+
+    ignored = {s for s in stems if role[s] == "ignore"}      # in neither split (see class_config.json)
+    train = {s for s in stems if role[s] == "train_only"}
+    val = {s for s in stems if role[s] == "val_only"} | forced
+    pool = [s for s in stems if role[s] == "random" and s not in forced]
+
+    n_eligible = len(pool) + len(forced)
+    target = int(round(val_fraction * n_eligible))
+    need = max(0, min(len(pool), target - len(forced)))
+    extra = set()
+    if need and need < len(pool):
+        strat = [src[s] for s in pool]
+        counts = {k: strat.count(k) for k in set(strat)}
+        strat = [k if counts[k] >= 2 else "_rare" for k in strat]
+        try:
+            _, extra_l = train_test_split(pool, test_size=need, random_state=seed, stratify=strat)
+        except ValueError:
+            _, extra_l = train_test_split(pool, test_size=need, random_state=seed)
+        extra = set(extra_l)
+    elif need >= len(pool):
+        extra = set(pool)
+    val |= extra
+    train |= set(pool) - extra
+
+    if verbose:
+        rows = {}
+        for s in stems:
+            r = rows.setdefault(src[s], {"train": 0, "val": 0, "forced_val": 0, "ignored": 0})
+            if s in ignored:
+                r["ignored"] += 1
+            elif s in val:
+                r["val"] += 1
+                r["forced_val"] += int(s in forced)
+            else:
+                r["train"] += 1
+        print("split by source (files): " + "; ".join(
+            (f"{k}: IGNORED {v['ignored']}" if v["ignored"] and not (v["train"] or v["val"]) else
+             f"{k}: train {v['train']} / val {v['val']}" + (f" (forced {v['forced_val']})" if v["forced_val"] else ""))
+            for k, v in sorted(rows.items())))
+        print(f"split: {len(train)} train / {len(val)} val files, {len(ignored)} ignored "
+              f"({100 * len(val) / max(1, len(stems) - len(ignored)):.1f}% of used files; "
+              f"{100 * len(val) / max(1, n_eligible):.1f}% of the random-eligible pool; "
+              f"{len(forced)} forced-val for val-only classes)")
+    return sorted(train), sorted(val)
+
+
+def class_bin_table(df_anno: pd.DataFrame, train_stems, val_stems, audio_index: dict, label_list,
+                    interval: float = 0.5) -> pd.DataFrame:
+    """v13: unique positive bins (the labels the model is actually trained /
+    scored on: 0.5 s bins touched by >=1 annotation of the class, overlapping
+    annotations counted once) per class x source x split. Windows overlap and
+    are duplicated for augmentation, so this is the honest "how much label
+    signal is there" number, not a window count."""
+    train_set, val_set = set(train_stems), set(val_stems)
+    d = df_anno[df_anno["label"].isin(list(label_list))]
+    src_cache = {}
+    rows = []
+    for (stem, lb), g in d.groupby(["stem", "label"]):
+        a = np.floor(g["t_1_s"].to_numpy(dtype=float) / interval).astype(int)
+        b = np.maximum(np.ceil(g["t_2_s"].to_numpy(dtype=float) / interval).astype(int), a + 1)
+        order = np.argsort(a, kind="stable")
+        a, b = a[order], b[order]
+        total, cs, ce = 0, a[0], b[0]
+        for x, y in zip(a[1:], b[1:]):
+            if x <= ce:
+                ce = max(ce, y)
+            else:
+                total += ce - cs
+                cs, ce = x, y
+        total += ce - cs
+        if stem not in src_cache:
+            src_cache[stem] = CLASS_CFG.source_of(stem, audio_index.get(stem))
+        split = "train" if stem in train_set else ("val" if stem in val_set else "unused")
+        rows.append((lb, src_cache[stem], split, stem, len(g), int(total)))
+    t = pd.DataFrame(rows, columns=["class", "source", "split", "stem", "annotations", "bins"])
+    if t.empty:
+        return pd.DataFrame(columns=["class", "source", "split", "files", "annotations", "positive_bins"])
+    return (t.groupby(["class", "source", "split"])
+             .agg(files=("stem", "nunique"), annotations=("annotations", "sum"), positive_bins=("bins", "sum"))
+             .reset_index())
+
+
+def _print_split_class_bins(df_anno, train_stems, val_stems, audio_index, label_list):
+    t = class_bin_table(df_anno, train_stems, val_stems, audio_index, label_list)
+    if t.empty:
+        print("(no annotated bins found)")
+        return
+    piv = t.pivot_table(index="class", columns="split", values="positive_bins", aggfunc="sum", fill_value=0)
+    for col in ("train", "val"):
+        if col not in piv.columns:
+            piv[col] = 0
+    print("positive 0.5 s bins per class (unique):")
+    for lb in label_list:
+        tr, va = (int(piv.loc[lb, "train"]), int(piv.loc[lb, "val"])) if lb in piv.index else (0, 0)
+        flag = "  <-- no validation positives (excluded from the selection score)" if va < MIN_VAL_POSITIVE_BINS else ""
+        print(f"  {lb:22s} train {tr:9d}   val {va:7d}{flag}")
+
+
+def get_split(args, audio_index: dict, df_anno: pd.DataFrame, verbose: bool = True):
+    """v13: the split every script should use -- a precomputed one from
+    --split-dir (train_files.txt/val_files.txt, see make_split.py) when given,
+    else computed with split_files. Keeps training, evaluation and the plots
+    on one identical split."""
+    split_dir = getattr(args, "split_dir", None)
+    if split_dir:
+        def _read(n):
+            with open(os.path.join(split_dir, n)) as f:
+                return [l.strip() for l in f if l.strip()]
+        tr = [s for s in _read("train_files.txt") if s in audio_index]
+        va = [s for s in _read("val_files.txt") if s in audio_index]
+        if verbose:
+            print(f"split read from {split_dir}: {len(tr)} train / {len(va)} val files "
+                  f"(of {len(audio_index)} audio files found)")
+        return sorted(tr), sorted(va)
+    return split_files(audio_index, val_fraction=getattr(args, "val_fraction", 0.30),
+                       seed=getattr(args, "seed", 0), df_anno=df_anno, verbose=verbose)
 
 
 MIN_CLASS_COUNT_WARNING = 20
@@ -730,7 +805,10 @@ def compute_window_class_presence(df_data: pd.DataFrame, df_anno: pd.DataFrame, 
     return presence
 
 
-NOISE_POOL_SIZE = 24
+# v10.2: 100 real background windows per split for augment_waveform's noise
+# mixing (a small pool gives thin coverage of real background diversity).
+# Default only -- see PamSequenceDataset's noise_pool_size / --noise-pool-size.
+NOISE_POOL_SIZE = 100
 
 # Shared shaped-dither constants for upsampling PAST a file's own native
 # Nyquist -- see make_shaped_dither's docstring. RAMP_START_FRAC/REF_BAND_FRAC
@@ -811,7 +889,8 @@ def _load_window_waveform(path: str, sr: int, start_sec: float, stop_sec: float)
     return waveform[:, start_sample:stop_sample].numpy().squeeze(0)
 
 
-def augment_waveform(audio: np.ndarray, rng: np.random.Generator, noise_pool: list = None) -> np.ndarray:
+def augment_waveform(audio: np.ndarray, rng: np.random.Generator, noise_pool: list = None,
+                     cfg: dict = None) -> np.ndarray:
     """Gain jitter + additive noise (mixed in from `noise_pool` -- real
     background windows from this training split -- when available, else
     plain Gaussian noise). Mirrors perch_training's
@@ -834,17 +913,24 @@ def augment_waveform(audio: np.ndarray, rng: np.random.Generator, noise_pool: li
     the probability of mixing in noise at all, and quietened the Gaussian
     fallback to match.
     """
+    # `cfg` (optional) overrides the three knobs below; training uses the v3
+    # conservative defaults (gain +-6 dB, noise 50% of the time at 6-20 dB SNR).
+    cfg = cfg or {}
+    g_lo, g_hi = cfg.get("gain_db", (-6.0, 6.0))
+    p_noise = cfg.get("noise_prob", 0.5)
+    snr_lo, snr_hi = cfg.get("snr_db", (6.0, 20.0))
+
     out = audio.copy()
 
-    gain_db = rng.uniform(-6.0, 6.0)
+    gain_db = rng.uniform(g_lo, g_hi)
     out = out * (10.0 ** (gain_db / 20.0))
 
-    if noise_pool and rng.random() < 0.5:
+    if noise_pool and rng.random() < p_noise:
         noise = noise_pool[rng.integers(len(noise_pool))]
         if len(noise) != len(out):
             reps = int(np.ceil(len(out) / len(noise)))
             noise = np.tile(noise, reps)[:len(out)]
-        snr_db = rng.uniform(6.0, 20.0)
+        snr_db = rng.uniform(snr_lo, snr_hi)
         sig_power = np.mean(out ** 2) + 1e-12
         noise_power = np.mean(noise ** 2) + 1e-12
         target_noise_power = sig_power / (10.0 ** (snr_db / 10.0))
@@ -862,77 +948,75 @@ def augment_waveform(audio: np.ndarray, rng: np.random.Generator, noise_pool: li
 # --------------------------------------------------------------------------
 
 class PamSequenceDataset(Dataset):
-    """Cuts each recording into overlapping ``snippet_length_s`` windows,
-    computes a spectrogram per window, and rasterizes the annotations
-    falling in that window into a (num_classes, timesteps) multi-hot label
-    grid at ``label_interval_s`` resolution. One dataset instance covers a
-    single band ("lf" or "hf") and a single split (a list of file stems).
+    """Cuts each recording into overlapping ``snippet_length_s`` windows and
+    returns, per window, the window's raw audio (for CQTFrontend, which
+    computes the spectrogram on the model's device) plus a (num_classes,
+    timesteps) multi-hot label grid at ``label_interval_s`` resolution (and,
+    with return_mask=True, the matching loss/metric mask). One dataset
+    instance covers one split (a list of file stems).
+
+    __getitem__ returns ({"wave": (1, n_total) float32, "aug": int64 scalar},
+    labels[, mask]). "wave" is (snippet_length_s + 2 * WINDOW_LOAD_PAD_S) * sr
+    samples with the window itself always at [pad * sr, (pad + snippet) * sr);
+    "aug" is the number of SpecAugment stripes CQTFrontend draws for this
+    window in training (0 for the clean copy of every window, 2 for the
+    augmented copy -- see __init__).
     """
 
     # v8: per-worker (each DataLoader worker process gets its own copy of
-    # this dataset, so these caches are NOT shared across workers -- still
-    # a large win, since a worker keeps landing on the same file's other
-    # overlapping windows within one epoch's worth of its own share of
-    # work) bounded caches -- see _spectrogram_for_subband's own docstring
-    # for what's cached and why. Bounded (not unbounded) so a large dataset
-    # can't blow up worker memory; a plain FIFO eviction (oldest-inserted
-    # first) rather than true LRU -- simpler, and "the last N distinct
-    # files/sub-bands touched" is a good enough proxy for temporal locality
-    # here without tracking per-access recency.
+    # this dataset, so this cache is NOT shared across workers) bounded FIFO
+    # cache of decoded window waveforms -- each window appears twice in a
+    # training epoch (clean + augmented copy), so the second access skips the
+    # decode. Bounded so a large dataset can't blow up worker memory.
     _CACHE_MAX_ENTRIES = 64
 
+    # Seconds of extra audio loaded on each side of a window's own
+    # [start_sec, stop_sec): CQTFrontend computes ONE circular CQT over the
+    # padded window, so wrap-around and the low bins' long windows only touch
+    # this padding, which it crops off. Must equal BAND_CONFIG["cqt"]["cqt_pad_s"].
+    WINDOW_LOAD_PAD_S = 2.0
+
     def __init__(self, file_stems, audio_index: dict, df_anno: pd.DataFrame,
-                 band: str, augment: bool = False, full_coverage: bool = False,
-                 bluefin_hf_dir: str = None, fusion_mode: str = "stack"):
-        assert band in BAND_CONFIG
+                 band: str = "cqt", augment: bool = False, full_coverage: bool = False,
+                 bluefin_hf_dir: str = None, noise_pool_size: int = NOISE_POOL_SIZE,
+                 return_mask: bool = False):
+        assert band in BAND_CONFIG, f"unknown band {band!r} (v17 has only {list(BAND_CONFIG)})"
         self.band = band
         self.cfg = BAND_CONFIG[band]
-        self.model_labels = BAND_LABELS[band]
+        assert self.cfg["cqt_pad_s"] == self.WINDOW_LOAD_PAD_S, \
+            "BAND_CONFIG['cqt']['cqt_pad_s'] must equal PamSequenceDataset.WINDOW_LOAD_PAD_S"
+        self.model_labels = list(BAND_LABELS[band])
         self.num_classes = len(self.model_labels)
+        # v13: when True, __getitem__ returns (x, labels, mask) -- mask is
+        # (num_classes, timesteps), 1 = this class/bin contributes to loss and
+        # metrics, 0 = masked (class not annotated for this file's source, or
+        # an "uncertain" annotation covers the bin). Default False keeps the
+        # (x, labels) contract inference/plot scripts rely on.
+        self.return_mask = return_mask
+        self.stem_scope = stem_scope_matrix(file_stems, audio_index, self.model_labels)
         self.augment = augment
-        # v9: only consulted when band=="joint" -- see train_lf.py's
-        # --fusion-mode comment.
-        self.fusion_mode = fusion_mode
+        self.noise_pool_size = noise_pool_size
 
-        # v8 (option C wiring): band=="joint" HF sub-band audio for a
-        # bluefin-sourced stem gets loaded from here INSTEAD of the file's
-        # normal (500 Hz) path, if a same-named file exists -- see
-        # precompute_bluefin_hf_cache.py, which pre-resamples+dithers
-        # bluefin_library_aplose up to HF's rate once, offline, so this
-        # never has to happen live at train time. None/no match falls back
-        # to the original path (live resample+dither in
-        # _spectrogram_for_subband, same as before this existed).
+        # v8 (option C): a bluefin-sourced stem with a same-named file here
+        # (precompute_bluefin_hf_cache.py: bluefin files pre-resampled+dithered
+        # to 32 kHz once, offline) loads its audio from here instead of
+        # live-resampling its 500 Hz file on every access. Not needed with
+        # --training-data, where every file is already 32 kHz.
         self.bluefin_hf_index = build_audio_index([bluefin_hf_dir]) if bluefin_hf_dir else {}
-        if band == "joint":
-            if bluefin_hf_dir:
-                print(f"[joint] bluefin_hf_dir={bluefin_hf_dir!r}: {len(self.bluefin_hf_index)} cached "
-                      f"HF-rate file(s) found -- bluefin stems matching one of these load their HF sub-band "
-                      f"audio from here instead of live-resampling")
-            else:
-                print("[joint] --bluefin-hf-dir not set -- every bluefin HF sub-band access will be "
-                      "live-resampled+dithered from its 500 Hz file (see precompute_bluefin_hf_cache.py to "
-                      "avoid this)")
+        if bluefin_hf_dir:
+            print(f"[{band}] bluefin_hf_dir={bluefin_hf_dir!r}: {len(self.bluefin_hf_index)} cached 32 kHz "
+                  f"file(s) -- matching bluefin stems load from here instead of live-resampling")
 
         # v8 debug instrumentation, see DEBUG_TIMING's own module-level
-        # comment -- None (and every _spectrogram_for_subband timing check
-        # below a no-op) unless PAM_DEBUG_TIMING=1 is set.
+        # comment -- None (and every timing check below a no-op) unless
+        # PAM_DEBUG_TIMING=1 is set.
         self._timing = _TimingStats() if DEBUG_TIMING else None
 
-        # v8 (option A), keyed per WINDOW since v8.1 (not per whole file --
-        # see _spectrogram_for_subband's own docstring for the full
-        # reasoning/history): (resolved path, sub-band tag, start_sec,
-        # stop_sec) -> the decoded/resampled/dithered waveform or finished
-        # spectrogram for that exact window. Mainly hits for the one case
-        # v8.1's windowing guarantees will recur -- each window appears
-        # TWICE in df_data (once clean, once to augment, see below), same
-        # (path, start_sec, stop_sec) both times.
+        # (resolved path, tag, start_sec, stop_sec) -> (decoded/resampled/
+        # dithered window waveform, pad_start_s, pad_stop_s)
         self._waveform_cache = OrderedDict()
-        self._clean_spec_cache = OrderedDict()
-        # v9.1: filenames we've already printed a truncated-file warning
-        # for (see _spectrogram_for_subband's 0-frame handling) -- one
-        # print per file, not per window, so a badly truncated file
-        # doesn't spam thousands of identical warnings across its tail
-        # windows.
+        # v9.1: filenames we've already printed a truncated-file warning for
+        # (see _load_padded_waveform) -- one print per file, not per window.
         self._truncated_file_warned = set()
 
         self.df_anno = df_anno[df_anno["stem"].isin(file_stems)].reset_index(drop=True)
@@ -952,44 +1036,20 @@ class PamSequenceDataset(Dataset):
                 try:
                     dur = librosa.get_duration(path=path)
                 except Exception as exc:
-                    # A file neither soundfile nor librosa/audioread can
-                    # even read the DURATION of -- genuinely unreadable
-                    # (missing codec backend, badly corrupt header), not
-                    # the milder truncated-tail case _raw_waveform_for_
-                    # window/_spectrogram_for_subband already handle
-                    # per-window. Skipped from the window grid entirely
-                    # rather than letting the exception propagate and
-                    # crash the WHOLE dataset's construction -- confirmed
-                    # as a real risk, not hypothetical: one such file in a
-                    # multi-thousand-file folder previously took down an
-                    # entire inference job (run_all_sequential.sh's own
-                    # per-job try/except caught THAT, but every file in
-                    # the same job was lost with it -- this is the
-                    # finer-grained fix, one bad file costing only itself).
+                    # A file neither soundfile nor librosa/audioread can read the
+                    # duration of (missing codec backend, corrupt header): skip it
+                    # instead of letting one bad file crash the whole dataset build.
                     skipped_files.append(stem)
                     print(f"WARNING: skipping {path!r} -- duration unreadable by both soundfile and "
                           f"librosa/audioread ({exc!r}); file may be corrupt or in an unsupported format")
                     continue
             n_steps = max(1, int(np.floor((dur - snippet_length) / hop)) + 1) if dur > snippet_length else 1
             starts = np.arange(n_steps) * hop
-            # The regular hop-spaced grid above always starts its first
-            # window at 0 (covering the file's true beginning), but its
-            # LAST window can fall short of the file's true end whenever
-            # (dur - snippet_length) isn't an exact multiple of hop -- the
-            # remainder is simply dropped by floor(), leaving a real,
-            # never-covered gap at the tail (confirmed on a real 300s file:
-            # regular grid's last window stopped at 270s, leaving the final
-            # ~30s permanently NaN in run_inference.py's output). Deployment
-            # scoring (run_inference.py passes full_coverage=True) adds one
-            # extra window anchored to end exactly at the file's true end
-            # to close that gap -- it will typically overlap its
-            # predecessor by more than the usual hop (a single, not
-            # sliding-window, pass over that stretch specifically), which
-            # is an accepted tradeoff for full coverage, not a bug. NOT
-            # applied to training/validation (both leave full_coverage at
-            # its False default) since that would add an extra, differently
-            # -weighted window into what the loss/threshold calibration
-            # sees -- out of scope for a deployment-coverage fix.
+            # The regular grid always starts at 0 but its last window can stop
+            # short of the file's end. Deployment scoring (run_inference.py,
+            # full_coverage=True) adds one extra window ending exactly at the
+            # file's end; training/validation do not (it would add an extra,
+            # differently-weighted window to the loss/threshold calibration).
             if full_coverage and dur > snippet_length:
                 last_stop = starts[-1] + snippet_length
                 if last_stop < dur - 1e-6:
@@ -1006,6 +1066,8 @@ class PamSequenceDataset(Dataset):
                   f"{' ... (truncated)' if len(skipped_files) > 20 else ''}")
         df_data["n_augment_stripes"] = 0
 
+        # Training: every window twice -- once clean, once with waveform
+        # augmentation (here) and 2 SpecAugment stripes (CQTFrontend).
         if augment:
             df_data_2 = df_data.copy()
             df_data_2["n_augment_stripes"] = 2
@@ -1017,50 +1079,28 @@ class PamSequenceDataset(Dataset):
         self.label_interval = self.cfg["label_interval_s"]
         self.timesteps = int(snippet_length / self.label_interval) + 1
 
-        # Per-window (num_samples, num_classes) bool: does each window
-        # overlap an annotation of that class. Pure metadata, cheap to
-        # compute up front -- used by run_training to build a rare-class
-        # aware WeightedRandomSampler (loss-level class weighting alone
-        # doesn't help if the model rarely even sees a rare-class window).
+        # Per-window (num_samples, num_classes) bool: does each window overlap
+        # an annotation of that class -- used by run_training's rare-class
+        # aware WeightedRandomSampler.
         self.class_presence = compute_window_class_presence(self.df_data, self.df_anno, self.model_labels)
 
         # v2: real background windows for augment_waveform's noise mixing,
-        # sampled once here (not per __getitem__ call -- that would mean
-        # decoding a whole extra file on every augmented sample). Fixed seed
-        # so the same pool is picked run-to-run for a given split/band.
-        # v7: band=="joint" needs TWO pools (one per sub-band's own sample
-        # rate -- self.cfg has no single top-level "sample_rate" for
-        # "joint", see BAND_CONFIG["joint"]), a dict instead of the flat
-        # list every other band uses. _spectrogram_for_subband picks the
-        # matching one by sub-band name.
-        self.noise_pool = {"hf": [], "lf": []} if band == "joint" else []
+        # sampled once here with a fixed seed (same pool run-to-run per split).
+        self.noise_pool = []
         if augment:
             bg_idx = np.where(~self.class_presence.any(axis=1))[0]
             pool_rng = np.random.default_rng(0)
-            pick = pool_rng.choice(bg_idx, size=min(NOISE_POOL_SIZE, len(bg_idx)), replace=False) \
+            pick = pool_rng.choice(bg_idx, size=min(self.noise_pool_size, len(bg_idx)), replace=False) \
                 if len(bg_idx) else []
-            if band == "joint":
-                for i in pick:
-                    r = self.df_data.loc[i]
-                    for sub in ("hf", "lf"):
-                        try:
-                            self.noise_pool[sub].append(_load_window_waveform(
-                                r["filename"], self.cfg["sub_bands"][sub]["sample_rate"],
-                                r["start_sec"], r["stop_sec"]))
-                        except Exception as e:
-                            print(f"WARNING: couldn't load {sub} noise-pool window from {r['filename']}: {e}")
-                print(f"[joint] noise pool: {len(self.noise_pool['hf'])} hf + "
-                      f"{len(self.noise_pool['lf'])} lf background windows")
-            else:
-                for i in pick:
-                    r = self.df_data.loc[i]
-                    try:
-                        self.noise_pool.append(
-                            _load_window_waveform(r["filename"], self.cfg["sample_rate"], r["start_sec"], r["stop_sec"])
-                        )
-                    except Exception as e:
-                        print(f"WARNING: couldn't load noise-pool window from {r['filename']}: {e}")
-                print(f"[{band}] noise pool: {len(self.noise_pool)} background windows")
+            for i in pick:
+                r = self.df_data.loc[i]
+                try:
+                    self.noise_pool.append(
+                        _load_window_waveform(r["filename"], self.cfg["sample_rate"], r["start_sec"], r["stop_sec"])
+                    )
+                except Exception as e:
+                    print(f"WARNING: couldn't load noise-pool window from {r['filename']}: {e}")
+            print(f"[{band}] noise pool: {len(self.noise_pool)} background windows")
 
         print(f"[{band}] {self.num_samples} windows from {len(file_stems)} files")
 
@@ -1068,276 +1108,151 @@ class PamSequenceDataset(Dataset):
         return self.num_samples
 
     def _cache_put(self, cache: OrderedDict, key, value):
-        """FIFO-bounded insert -- see _CACHE_MAX_ENTRIES/__init__'s own
-        comment for why FIFO (not true LRU) is good enough here."""
+        """FIFO-bounded insert (oldest-inserted first out)."""
         cache[key] = value
         if len(cache) > self._CACHE_MAX_ENTRIES:
             cache.popitem(last=False)
 
-    def _compute_spectrogram(self, waveform, cfg=None):
-        # v7: optional explicit `cfg` -- band=="joint" calls this once per
-        # sub-band (see _spectrogram_for_subband) with that sub-band's OWN
-        # config, not self.cfg (which has no fft_size/n_mels/etc of its own
-        # for "joint", only a `sub_bands` dict -- see BAND_CONFIG["joint"]).
-        # Every existing lf/hf call site omits `cfg`, so this defaults to
-        # self.cfg exactly as before -- no behavior change for those.
-        cfg = cfg if cfg is not None else self.cfg
-        sr = cfg["sample_rate"]
-        fft_size = cfg["fft_size"]
-        hop_length = int(fft_size * cfg["fft_overlap"])
-
-        if cfg["n_mels"]:
-            spec = torchaudio.transforms.MelSpectrogram(
-                sample_rate=sr, n_fft=fft_size, hop_length=hop_length,
-                n_mels=cfg["n_mels"], f_min=cfg["f_min"], f_max=cfg["f_max"],
-            )(waveform)
-            # Drops mel filter rows that are STRUCTURALLY always zero (an
-            # artifact of the filterbank/f_min/f_max/sample_rate
-            # combination, not of any one file) -- but checking only frame
-            # 0 (as this used to) is a fragile proxy for that: a file whose
-            # very first frame happens to be genuinely silent (a near-empty
-            # AURAL/SOI stub file, or just a quiet lead-in) reads every mel
-            # bin as exactly 0 there, so ALL rows get dropped and the
-            # (0-row) spectrogram crashes torchvision's Resize downstream
-            # with "Input and output sizes should be greater than 0" --
-            # confirmed as a real crash in deployment inference. Checking
-            # for nonzero power in ANY frame across the whole file is far
-            # more robust to one silent frame; the `valid.any()` fallback
-            # additionally covers the (much rarer) case of a file silent in
-            # literally every frame, keeping every bin unfiltered rather
-            # than crashing -- a few always-zero rows surviving into a
-            # normal file's spectrogram is a much smaller cost than losing
-            # the whole inference run to one bad file.
-            valid = (spec[0] > 0).any(dim=-1)
-            if valid.any():
-                spec = spec[:, valid, :]
+    def _load_padded_waveform(self, filename, sr, start_sec, stop_sec, cache_key=None, min_len=1):
+        """v17: the decode -> (resample + shaped dither) -> silence-pad part of
+        _spectrogram_for_subband, split out unchanged so band="cqt" can reuse it
+        without computing a spectrogram here. Returns (waveform (1, n) at `sr`,
+        pad_start_s, pad_stop_s): the slice [start_sec - WINDOW_LOAD_PAD_S,
+        stop_sec + WINDOW_LOAD_PAD_S] clamped to the file, cached per window in
+        self._waveform_cache under `cache_key` (already including start/stop)."""
+        timing = self._timing
+        cached = self._waveform_cache.get(cache_key) if cache_key is not None else None
+        if cached is not None:
+            waveform, pad_start_s, pad_stop_s = cached
         else:
-            spec = torchaudio.transforms.Spectrogram(
-                n_fft=fft_size, hop_length=hop_length,
-            )(waveform)
+            t0 = time.perf_counter() if timing is not None else None
+            # _audio_info reads only the header (sample_rate/
+            # num_frames), not the audio itself -- needed to convert
+            # the padded window's seconds into native-rate sample
+            # offsets before loading, and to clamp the padding at the
+            # file's own true end.
+            sr_org, total_frames = _audio_info(filename)
+            file_duration_s = total_frames / sr_org
+            pad_start_s = max(0.0, start_sec - self.WINDOW_LOAD_PAD_S)
+            pad_stop_s = min(file_duration_s, stop_sec + self.WINDOW_LOAD_PAD_S)
+            frame_offset = int(round(pad_start_s * sr_org))
+            num_frames = max(1, int(round((pad_stop_s - pad_start_s) * sr_org)))
+            waveform, _ = _load_audio(filename, frame_offset=frame_offset, num_frames=num_frames)
+            if waveform.shape[-1] < num_frames:
+                # Real field-recorder files occasionally have a WAV
+                # header whose frame count overstates what's actually
+                # on disk (e.g. the mooring lost power or filled its
+                # disk mid-write) -- sf.info()'s header-reported
+                # duration then overstates the true, readable
+                # duration, so a window/pad computed from it (both
+                # here and in __init__'s window grid, which uses the
+                # same sf.info().duration) can land at or past the
+                # real end of the data chunk, where sf.read() returns
+                # fewer frames than requested -- anywhere from a
+                # FULLY empty read (frame_offset already past the
+                # real end of data) down to just a handful of
+                # leftover samples (frame_offset lands just before
+                # it). Either way, padding the shortfall with
+                # trailing silence keeps a many-thousand-file
+                # unattended run going instead of crashing the whole
+                # job over one truncated file's tail.
+                if filename not in self._truncated_file_warned:
+                    self._truncated_file_warned.add(filename)
+                    print(f"WARNING: {filename} returned {waveform.shape[-1]}/{num_frames} requested "
+                          f"audio frames at sample offset {frame_offset} (file may be truncated/"
+                          f"corrupted -- header duration overstates what's actually on disk); "
+                          f"padding the shortfall with silence instead of aborting the run")
+                pad_amount = num_frames - waveform.shape[-1]
+                waveform = torch.cat([waveform, torch.zeros(1, pad_amount, dtype=waveform.dtype)], dim=-1)
+            if timing is not None:
+                timing.add("decode", time.perf_counter() - t0)
+            if sr != sr_org:
+                t0 = time.perf_counter() if timing is not None else None
+                waveform = torchaudio.transforms.Resample(orig_freq=sr_org, new_freq=sr)(waveform)
+                if sr > sr_org:
+                    # Upsampling past this file's own native Nyquist --
+                    # fill the newly-opened band with shaped dither (see
+                    # make_shaped_dither's docstring) instead of a
+                    # suspiciously clean, hard-silent edge the model
+                    # could learn to associate with these files
+                    # specifically rather than the real acoustic
+                    # content. This is the case a bluefin-derived file
+                    # (already resampled+dithered to 500 Hz by
+                    # convert_bluefin_library.py) hits when loaded for
+                    # the joint model's HF sub-band (target 32 kHz) -- a
+                    # ~6-7 octave upsample, so the steeper HF rolloff
+                    # constant is used once the ratio is clearly in that
+                    # regime (>=4x); a small-ratio upsample (the kind
+                    # convert_bluefin_library.py's own LF-target
+                    # conversion already handles offline) gets that
+                    # script's own, gentler, already-approved constant
+                    # instead. Skipped entirely when the caller already
+                    # resolved `filename` to a precomputed 32 kHz cache
+                    # (see PamSequenceDataset's bluefin_hf_index /
+                    # precompute_bluefin_hf_cache.py, option C) -- there,
+                    # sr_org == sr already, so this whole branch is a
+                    # no-op and the live cost it describes never happens.
+                    # NOTE (v8.1): the dither draw is independent per
+                    # window now rather than shared across a whole
+                    # file's overlapping windows -- harmless, since this
+                    # noise is synthetic filler standing in for "no real
+                    # information" either way, not real signal that
+                    # needs to stay consistent across nearby windows.
+                    rolloff = DITHER_ROLLOFF_DB_PER_OCT_HF if sr >= 4 * sr_org else DITHER_ROLLOFF_DB_PER_OCT_LF
+                    dither = make_shaped_dither(waveform.numpy().squeeze(0), sr, sr_org,
+                                                 np.random.default_rng(), rolloff)
+                    waveform = waveform + torch.from_numpy(dither).unsqueeze(0)
+                if timing is not None:
+                    timing.add("resample_dither", time.perf_counter() - t0)
 
-        return torch.log10(spec + 1e-12)
+            # Final belt-and-suspenders floor, independent of the
+            # truncated-file padding above: torch.stft's default
+            # center=True reflect-pads by fft_size//2 on each side,
+            # which itself raises if the input isn't longer than that
+            # pad -- a real risk any time a window's own true span
+            # (not just a truncated file's missing tail) is shorter
+            # than the sub-band's own FFT window, e.g. a genuinely
+            # very short recording file. Padding with silence up to
+            # fft_size here (rather than letting _compute_spectrogram
+            # crash on it) trades one nearly-empty window's score for
+            # the run's ability to keep going.
+            if waveform.shape[-1] < min_len:
+                waveform = torch.cat(
+                    [waveform, torch.zeros(1, min_len - waveform.shape[-1], dtype=waveform.dtype)], dim=-1)
 
-    # v8.1: seconds of extra audio loaded/transformed on each side of a
-    # window's own [start_sec, stop_sec) -- see _spectrogram_for_subband's
-    # own docstring for why. Comfortably bigger than either sub-band's own
-    # FFT window (LF: fft_size=256 @ 500 Hz = 0.512s; HF: fft_size=8192 @
-    # 32 kHz = 0.256s), so the frames actually inside [start_sec, stop_sec)
-    # always have real audio context on both sides, not a truncated/
-    # zero-padded edge.
-    WINDOW_LOAD_PAD_S = 2.0
+            if cache_key is not None:
+                self._cache_put(self._waveform_cache, cache_key, (waveform, pad_start_s, pad_stop_s))
+        return waveform, pad_start_s, pad_stop_s
 
-    def _spectrogram_for_subband(self, filename, sub_cfg, freq_bins, time_bins,
-                                  start_sec, stop_sec, n_augment, noise_pool, cache_key=None):
-        """One band's windowed, resized (1, freq_bins, time_bins) spectrogram
-        for one file/window -- the per-window process __getitem__ always did
-        for its single band, extracted here so band=="joint" can call it
-        TWICE (once per BAND_CONFIG["joint"]["sub_bands"] entry) instead of
-        duplicating this logic; a plain "lf"/"hf" dataset still calls this
-        exactly once, with sub_cfg=self.cfg/freq_bins=self.spec_dim[0]/
-        noise_pool=self.noise_pool.
-
-        v8.1: decodes and transforms ONLY this window's own slice (+/-
-        WINDOW_LOAD_PAD_S of padding for FFT edge context), not the whole
-        file. v8's first pass here (see git history / README's "v8 changes"
-        for the full writeup) decoded+spectrogram'd the ENTIRE file on
-        every access, relying on a per-file cache (see below) to avoid
-        redoing that across a file's several overlapping windows -- but a
-        real run showed the cache hitting 0% of the time under
-        run_training's WeightedRandomSampler (draws close to i.i.d. across
-        the whole dataset, so a bounded per-file cache rarely survives long
-        enough to be revisited), meaning that version was paying full
-        whole-file cost on nearly every single call regardless -- confirmed
-        as the actual bottleneck via PAM_DEBUG_TIMING (spectrogram compute
-        alone was ~87% of per-sample time on a real run, dominated by
-        computing HF's 8192-point/700-mel spectrogram over close to an
-        hour of audio to use 60 seconds of it). Loading only the needed
-        slice fixes this directly, independent of cache behavior, by
-        making the expensive part proportional to the WINDOW's duration
-        instead of the FILE's.
-
-        v8 (option A): `cache_key` (typically (resolved path, sub-band tag),
-        None to disable caching entirely) still helps skip repeat work for
-        the one case v8.1's windowing guarantees will recur: each window
-        appears TWICE in df_data (once clean, once to augment -- see
-        __init__), sharing the identical (path, start_sec, stop_sec) --
-        cache_key includes start_sec/stop_sec now (not just path/sub-band)
-        to key on that correctly.
-          - self._clean_spec_cache: the finished, freq-resized WINDOW
-            spectrogram for n_augment==0 rows -- reused verbatim if the
-            identical window is requested again.
-          - self._waveform_cache: the decoded/resampled/dithered WINDOW
-            waveform (pre-augmentation) -- reused for n_augment>0 rows too,
-            but never as a finished spectrogram (augment_waveform's gain
-            jitter + noise mixing must be freshly randomized every single
-            access; caching the augmented result would either freeze one
-            random draw forever or require recomputing anyway).
-        """
-        sr = sub_cfg["sample_rate"]
-        timing = self._timing  # None unless PAM_DEBUG_TIMING=1 -- see module-level DEBUG_TIMING comment
-
+    def _cqt_window_waveform(self, filename, start_sec, stop_sec, n_augment, cache_key=None):
+        """v17, band="cqt": the window's audio as a FIXED-length (1, (snippet_length_s
+        + 2 * cqt_pad_s) * sr) float32 tensor with the window itself always at samples
+        [pad * sr, (pad + snippet_length_s) * sr) -- CQTFrontend crops it by fixed
+        indices on the GPU. Padding that falls outside the file (a file's first/last
+        window, or a file shorter than the window) is zeros. Only the waveform-domain
+        augmentation (gain + noise mixing, augment_waveform) runs here, on the CPU
+        worker, because it needs this split's noise pool; the spectrogram, resizing,
+        normalisation and SpecAugment all run in CQTFrontend."""
+        cfg = self.cfg
+        sr = cfg["sample_rate"]
+        pad = self.WINDOW_LOAD_PAD_S
+        timing = self._timing
         if cache_key is not None:
             cache_key = (*cache_key, round(start_sec, 3), round(stop_sec, 3))
-
-        clean_cached = self._clean_spec_cache.get(cache_key) if (cache_key is not None and n_augment == 0) else None
-        if timing is not None and cache_key is not None and n_augment == 0:
-            timing.record_cache(hit=clean_cached is not None)
-
-        if clean_cached is not None:
-            spec, pad_start_s, pad_stop_s = clean_cached
-        else:
-            cached = self._waveform_cache.get(cache_key) if cache_key is not None else None
-            if cached is not None:
-                waveform, pad_start_s, pad_stop_s = cached
-            else:
-                t0 = time.perf_counter() if timing is not None else None
-                # _audio_info reads only the header (sample_rate/
-                # num_frames), not the audio itself -- needed to convert
-                # the padded window's seconds into native-rate sample
-                # offsets before loading, and to clamp the padding at the
-                # file's own true end.
-                sr_org, total_frames = _audio_info(filename)
-                file_duration_s = total_frames / sr_org
-                pad_start_s = max(0.0, start_sec - self.WINDOW_LOAD_PAD_S)
-                pad_stop_s = min(file_duration_s, stop_sec + self.WINDOW_LOAD_PAD_S)
-                frame_offset = int(round(pad_start_s * sr_org))
-                num_frames = max(1, int(round((pad_stop_s - pad_start_s) * sr_org)))
-                waveform, _ = _load_audio(filename, frame_offset=frame_offset, num_frames=num_frames)
-                if waveform.shape[-1] < num_frames:
-                    # Real field-recorder files occasionally have a WAV
-                    # header whose frame count overstates what's actually
-                    # on disk (e.g. the mooring lost power or filled its
-                    # disk mid-write) -- sf.info()'s header-reported
-                    # duration then overstates the true, readable
-                    # duration, so a window/pad computed from it (both
-                    # here and in __init__'s window grid, which uses the
-                    # same sf.info().duration) can land at or past the
-                    # real end of the data chunk, where sf.read() returns
-                    # fewer frames than requested -- anywhere from a
-                    # FULLY empty read (frame_offset already past the
-                    # real end of data) down to just a handful of
-                    # leftover samples (frame_offset lands just before
-                    # it). Either way, padding the shortfall with
-                    # trailing silence keeps a many-thousand-file
-                    # unattended run going instead of crashing the whole
-                    # job over one truncated file's tail.
-                    if filename not in self._truncated_file_warned:
-                        self._truncated_file_warned.add(filename)
-                        print(f"WARNING: {filename} returned {waveform.shape[-1]}/{num_frames} requested "
-                              f"audio frames at sample offset {frame_offset} (file may be truncated/"
-                              f"corrupted -- header duration overstates what's actually on disk); "
-                              f"padding the shortfall with silence instead of aborting the run")
-                    pad_amount = num_frames - waveform.shape[-1]
-                    waveform = torch.cat([waveform, torch.zeros(1, pad_amount, dtype=waveform.dtype)], dim=-1)
-                if timing is not None:
-                    timing.add("decode", time.perf_counter() - t0)
-                if sr != sr_org:
-                    t0 = time.perf_counter() if timing is not None else None
-                    waveform = torchaudio.transforms.Resample(orig_freq=sr_org, new_freq=sr)(waveform)
-                    if sr > sr_org:
-                        # Upsampling past this file's own native Nyquist --
-                        # fill the newly-opened band with shaped dither (see
-                        # make_shaped_dither's docstring) instead of a
-                        # suspiciously clean, hard-silent edge the model
-                        # could learn to associate with these files
-                        # specifically rather than the real acoustic
-                        # content. This is the case a bluefin-derived file
-                        # (already resampled+dithered to 500 Hz by
-                        # convert_bluefin_library.py) hits when loaded for
-                        # the joint model's HF sub-band (target 32 kHz) -- a
-                        # ~6-7 octave upsample, so the steeper HF rolloff
-                        # constant is used once the ratio is clearly in that
-                        # regime (>=4x); a small-ratio upsample (the kind
-                        # convert_bluefin_library.py's own LF-target
-                        # conversion already handles offline) gets that
-                        # script's own, gentler, already-approved constant
-                        # instead. Skipped entirely when the caller already
-                        # resolved `filename` to a precomputed 32 kHz cache
-                        # (see PamSequenceDataset's bluefin_hf_index /
-                        # precompute_bluefin_hf_cache.py, option C) -- there,
-                        # sr_org == sr already, so this whole branch is a
-                        # no-op and the live cost it describes never happens.
-                        # NOTE (v8.1): the dither draw is independent per
-                        # window now rather than shared across a whole
-                        # file's overlapping windows -- harmless, since this
-                        # noise is synthetic filler standing in for "no real
-                        # information" either way, not real signal that
-                        # needs to stay consistent across nearby windows.
-                        rolloff = DITHER_ROLLOFF_DB_PER_OCT_HF if sr >= 4 * sr_org else DITHER_ROLLOFF_DB_PER_OCT_LF
-                        dither = make_shaped_dither(waveform.numpy().squeeze(0), sr, sr_org,
-                                                     np.random.default_rng(), rolloff)
-                        waveform = waveform + torch.from_numpy(dither).unsqueeze(0)
-                    if timing is not None:
-                        timing.add("resample_dither", time.perf_counter() - t0)
-
-                # Final belt-and-suspenders floor, independent of the
-                # truncated-file padding above: torch.stft's default
-                # center=True reflect-pads by fft_size//2 on each side,
-                # which itself raises if the input isn't longer than that
-                # pad -- a real risk any time a window's own true span
-                # (not just a truncated file's missing tail) is shorter
-                # than the sub-band's own FFT window, e.g. a genuinely
-                # very short recording file. Padding with silence up to
-                # fft_size here (rather than letting _compute_spectrogram
-                # crash on it) trades one nearly-empty window's score for
-                # the run's ability to keep going.
-                min_len = sub_cfg["fft_size"]
-                if waveform.shape[-1] < min_len:
-                    waveform = torch.cat(
-                        [waveform, torch.zeros(1, min_len - waveform.shape[-1], dtype=waveform.dtype)], dim=-1)
-
-                if cache_key is not None:
-                    self._cache_put(self._waveform_cache, cache_key, (waveform, pad_start_s, pad_stop_s))
-
-            # v2: waveform-level augmentation (gain jitter + noise mixing),
-            # same gate as the spectrogram-domain stripe augmentation below
-            # -- only the "augmented half" of the training set gets either.
-            # Applied to the whole loaded (padded) slice since both
-            # transforms are time-invariant; see augment_waveform's
-            # docstring for why no time-shift is used here. A fresh copy,
-            # not applied in place -- `waveform` may be the shared cached
-            # tensor this same window's clean row will reuse next.
-            if n_augment > 0:
-                t0 = time.perf_counter() if timing is not None else None
-                rng = np.random.default_rng()
-                augmented = augment_waveform(waveform.numpy().squeeze(0), rng, noise_pool)
-                spec_waveform = torch.from_numpy(augmented).unsqueeze(0)
-                if timing is not None:
-                    timing.add("augment", time.perf_counter() - t0)
-            else:
-                spec_waveform = waveform
-
+        waveform, pad_start_s, _ = self._load_padded_waveform(filename, sr, start_sec, stop_sec, cache_key=cache_key)
+        if n_augment > 0:
             t0 = time.perf_counter() if timing is not None else None
-            spec = self._compute_spectrogram(spec_waveform, sub_cfg)
-
-            resize_transform = transforms.Resize((freq_bins, spec.shape[2]))
-            spec = resize_transform(spec)
+            augmented = augment_waveform(waveform.numpy().squeeze(0), np.random.default_rng(),
+                                         self.noise_pool)
+            waveform = torch.from_numpy(augmented).unsqueeze(0)
             if timing is not None:
-                timing.add("spectrogram+freq_resize", time.perf_counter() - t0)
-
-            if n_augment == 0 and cache_key is not None:
-                self._cache_put(self._clean_spec_cache, cache_key, (spec, pad_start_s, pad_stop_s))
-
-        t0 = time.perf_counter() if timing is not None else None
-        # Absolute (within-file) time axis: the loaded/transformed slice
-        # spans [pad_start_s, pad_stop_s) (not [0, file_duration) -- see
-        # above), so spec's own time bins must be anchored there, not at
-        # the file's true start, for this comparison against start_sec/
-        # stop_sec (also absolute-within-file) to land on the right bins.
-        # pad_start_s/pad_stop_s are cached alongside spec/waveform
-        # (not re-derived/approximated here) specifically because the
-        # padding can be asymmetrically clamped near a file's true start or
-        # end -- assuming the full +/-WINDOW_LOAD_PAD_S on both sides
-        # unconditionally would misalign this axis for any window within
-        # one pad-width of either edge.
-        t = np.linspace(pad_start_s, pad_stop_s, spec.shape[2])
-        ix = (t >= start_sec) & (t < stop_sec)
-        spec = spec[:, :, ix]
-        resize_transform = transforms.Resize((spec.shape[1], time_bins))
-        spec = resize_transform(spec)
-        if timing is not None:
-            timing.add("time_slice+resize", time.perf_counter() - t0)
-        return spec
+                timing.add("augment", time.perf_counter() - t0)
+        n_total = int(round((cfg["snippet_length_s"] + 2 * pad) * sr))
+        offset = int(round((pad_start_s - (start_sec - pad)) * sr))   # > 0 only when the left pad was clamped at 0 s
+        out = torch.zeros(1, n_total, dtype=torch.float32)
+        n = max(0, min(waveform.shape[-1], n_total - offset))
+        out[:, offset:offset + n] = waveform[:, :n]
+        return out
 
     def __getitem__(self, idx):
         item_t0 = time.perf_counter() if self._timing is not None else None
@@ -1345,63 +1260,12 @@ class PamSequenceDataset(Dataset):
         filename = row["filename"]
         stem = row["stem"]
         n_augment = int(row["n_augment_stripes"])
-        cfg = self.cfg
 
-        if self.band == "joint":
-            sub = cfg["sub_bands"]
-            # v8 (option C wiring): a bluefin-sourced stem with a matching
-            # entry in bluefin_hf_index (see __init__/precompute_bluefin_hf_
-            # cache.py) loads its HF sub-band audio from the precomputed
-            # 32 kHz cache instead of the file's normal (500 Hz) path --
-            # already at HF's target rate, so _spectrogram_for_subband's own
-            # sr != sr_org check is a no-op and the live resample+dither
-            # never happens for it. Falls back to `filename` (live resample)
-            # for every non-bluefin stem, unchanged from before this existed.
-            hf_path = self.bluefin_hf_index.get(stem, filename)
-            hf_spec = self._spectrogram_for_subband(
-                hf_path, sub["hf"], sub["hf"]["freq_bins"], self.spec_dim[1],
-                row["start_sec"], row["stop_sec"], n_augment, self.noise_pool["hf"],
-                cache_key=(hf_path, "hf"))
-            lf_spec = self._spectrogram_for_subband(
-                filename, sub["lf"], sub["lf"]["freq_bins"], self.spec_dim[1],
-                row["start_sec"], row["stop_sec"], n_augment, self.noise_pool["lf"],
-                cache_key=(filename, "lf"))
-
-            # v9: how the two sub-bands get combined -- see train_lf.py's
-            # --fusion-mode comment for the full reasoning behind each.
-            if self.fusion_mode == "stack":
-                # v7/v8 baseline, unchanged: concat on freq axis (HF on top
-                # of LF, top-to-bottom like a real spectrogram), single
-                # joint min-max normalize further down.
-                spec = torch.cat([hf_spec, lf_spec], dim=1)
-            elif self.fusion_mode == "stack_normfix":
-                # option 1: normalize each sub-band independently BEFORE
-                # stacking, so neither band's raw log-power range can
-                # dominate/wash out the other's contrast under a single
-                # joint min-max.
-                spec = torch.cat([_minmax_norm(hf_spec), _minmax_norm(lf_spec)], dim=1)
-            elif self.fusion_mode == "channels":
-                # option 2: resize both sub-bands to the SAME freq
-                # resolution and stack as separate input CHANNELS instead
-                # of extra frequency rows, so the CNN's first conv layer
-                # never convolves across the physically meaningless LF/HF
-                # frequency seam "stack" creates.
-                target_fb = cfg["channels_freq_bins"]
-                hf_r = _minmax_norm(_resize_freq(hf_spec, target_fb))
-                lf_r = _minmax_norm(_resize_freq(lf_spec, target_fb))
-                spec = torch.cat([hf_r, lf_r], dim=0)
-            elif self.fusion_mode == "twotower":
-                # option 3: keep both sub-bands fully separate -- each gets
-                # its own CNN tower in ImprovedCNNBiGRU, fused only after
-                # each tower's own pooled features are computed.
-                spec = {"hf": _minmax_norm(hf_spec), "lf": _minmax_norm(lf_spec)}
-            else:
-                raise ValueError(f"unknown fusion_mode {self.fusion_mode!r}")
-        else:
-            spec = self._spectrogram_for_subband(
-                filename, cfg, self.spec_dim[0], self.spec_dim[1],
-                row["start_sec"], row["stop_sec"], n_augment, self.noise_pool,
-                cache_key=(filename, "single"))
+        # bluefin stems: the precomputed 32 kHz copy if there is one (see __init__)
+        wave_path = self.bluefin_hf_index.get(stem, filename)
+        x = {"wave": self._cqt_window_waveform(wave_path, row["start_sec"], row["stop_sec"], n_augment,
+                                               cache_key=(wave_path, "cqt")),
+             "aug": torch.tensor(n_augment, dtype=torch.int64)}
 
         label_interval = self.label_interval
         t = np.arange(row["start_sec"], row["stop_sec"] + label_interval, label_interval)
@@ -1427,34 +1291,30 @@ class PamSequenceDataset(Dataset):
 
         labels = torch.from_numpy(score.T.astype("float32"))
 
-        # v9: stack_normfix/channels/twotower already normalized (per
-        # sub-band) above -- only "stack" (and every non-joint band) still
-        # needs the original single joint min-max here.
-        if isinstance(spec, dict):
-            pass
-        elif self.band != "joint" or self.fusion_mode == "stack":
-            spec = _minmax_norm(spec)
-
-        # v9: SpecAugment -- "stack"/"stack_normfix" (and non-joint bands)
-        # produce one tensor shaped exactly like self.spec_dim, so the
-        # original single-call form still applies unchanged; "channels"
-        # has a different freq resolution (cfg["channels_freq_bins"], not
-        # self.spec_dim[0]); "twotower" needs it applied per sub-band, each
-        # at its own native freq_bins.
-        if isinstance(spec, dict):
-            for key, sub_spec in spec.items():
-                spec[key] = _apply_specaugment(
-                    sub_spec, sub[key]["freq_bins"], self.spec_dim[1], cfg, n_augment)
-        elif self.band == "joint" and self.fusion_mode == "channels":
-            spec = _apply_specaugment(spec, cfg["channels_freq_bins"], self.spec_dim[1], cfg, n_augment)
-        else:
-            spec = _apply_specaugment(spec, self.spec_dim[0], self.spec_dim[1], cfg, n_augment)
+        mask = None
+        if self.return_mask:
+            keep = self.stem_scope.get(stem)
+            mask_np = np.ones((self.num_classes, len(t)), dtype="float32")
+            if keep is not None:
+                mask_np[~keep, :] = 0.0
+            if "mask_label" in df_anno_file.columns:
+                unc = df_anno_file[df_anno_file["mask_label"].notna()]
+                for _, r in unc.iterrows():
+                    if r["mask_label"] not in self.model_labels:
+                        continue
+                    ix_class = self.model_labels.index(r["mask_label"])
+                    b1 = max(np.digitize(r["t_1_s"], t) - 1, 0)
+                    b2 = np.digitize(r["t_2_s"], t)
+                    mask_np[ix_class, b1:max(b2, b1 + 1)] = 0.0
+            mask = torch.from_numpy(mask_np)
 
         if self._timing is not None:
             self._timing.add("__getitem__ total", time.perf_counter() - item_t0)
             self._timing.maybe_print(self.band)
 
-        return spec, labels
+        if self.return_mask:
+            return x, labels, mask
+        return x, labels
 
 
 def compute_class_weights(df_anno_train: pd.DataFrame, file_stems, audio_index: dict,
@@ -1462,22 +1322,160 @@ def compute_class_weights(df_anno_train: pd.DataFrame, file_stems, audio_index: 
     """Inverse-frequency class weights from annotated seconds per class,
     normalized to sum to num_classes (same formula the original scripts used,
     just computed from annotation durations instead of a slow full dataset
-    pass)."""
-    total_duration = 0.0
+    pass).
+
+    v13: scope-aware. A class's "total duration" is only the audio of files
+    whose source was actually annotated for that class (a class masked for
+    a file contributes neither positives nor negatives there), so adding a
+    big single-class dataset doesn't dilute every other class's weight."""
+    scope = stem_scope_matrix(file_stems, audio_index, label_list)
+    dur_per_class = np.zeros(len(label_list))
     for stem in file_stems:
         try:
-            total_duration += sf.info(audio_index[stem]).duration
+            d = sf.info(audio_index[stem]).duration
         except Exception:
-            total_duration += librosa.get_duration(path=audio_index[stem])
+            d = librosa.get_duration(path=audio_index[stem])
+        dur_per_class += d * scope[stem]
 
     class_seconds = np.zeros(len(label_list))
     for i, lb in enumerate(label_list):
         rows = df_anno_train[df_anno_train["label"] == lb]
         class_seconds[i] = (rows["t_2_s"] - rows["t_1_s"]).clip(lower=0).sum()
 
-    weights = total_duration / (len(label_list) * (class_seconds + 1))
+    weights = np.maximum(dur_per_class, 1.0) / (len(label_list) * (class_seconds + 1))
     weights = weights * len(label_list) / weights.sum()
     return torch.tensor(weights, dtype=torch.float32)
+
+
+# --------------------------------------------------------------------------
+# v17: CQT frontend (runs inside the model, i.e. on the GPU)
+# --------------------------------------------------------------------------
+
+def cqt_kernels(num_octaves: int, bins_per_octave: int, sample_rate: int, block_length: int,
+                gamma_hz: float = 0.0):
+    """Frequency-domain windows of a nonstationary-Gabor CQT, built exactly as
+    cqt-pytorch's CQT.__init__ builds them (archinetai/cqt-pytorch, MIT licence:
+    get_center_frequencies / get_bandwidths / get_windows_range_idx / get_windows),
+    plus one addition: `gamma_hz` is added to every band's width (variable-Q
+    transform, Schoerkhuber et al. 2014; librosa.vqt's `gamma`). Only the
+    positive-frequency bins are built, which is all CQT.encode uses.
+    Returns (freqs (K,), windows_range_idx (K, L) long, windows (K, L) float32),
+    K = num_octaves * bins_per_octave, L = the longest window."""
+    nyq = sample_rate / 2
+    K = num_octaves * bins_per_octave
+    freqs = nyq / (2 ** num_octaves) * (2 ** (torch.arange(K) / bins_per_octave))
+    freqs_all = torch.cat([freqs, torch.tensor([nyq]), sample_rate - torch.flip(freqs, dims=[0])])
+    q = 1.0 / (2 ** (1.0 / bins_per_octave) - 2 ** (-1.0 / bins_per_octave))
+    bandwidths = freqs_all[1:K + 1] / q + gamma_hz     # cqt-pytorch's indexing: bin k uses centre k+1
+    lengths = torch.round(bandwidths * block_length / sample_rate)
+    max_len = int(lengths.max())
+    positions = torch.round(freqs * block_length / sample_rate)
+    idx = torch.stack([torch.arange(start=p - max_len // 2, end=p - max_len // 2 + max_len)
+                       for p in positions]).long() % block_length
+    windows = []
+    for n in lengths:
+        pad_left = int(np.floor(max_len / 2 - n / 2))
+        pad_right = int(max_len - n - pad_left)
+        windows.append(F.pad(torch.hann_window(int(n)), pad=(pad_left, pad_right)))
+    return freqs, idx, torch.stack(windows)
+
+
+class CQTFrontend(nn.Module):
+    """v17: (B, 1, N) raw window audio -> (B, 1, freq_bins, time_bins) model input,
+    entirely in torch on the model's device: one variable-Q CQT over the whole
+    padded window (one FFT block, so no block-edge artefacts) -> |c|^2 -> crop
+    the padding -> average power into time_bins -> log10 -> bilinear resize of
+    the K log-spaced bins to freq_bins -> per-window min-max to [0, 1] ->
+    SpecAugment (training only, windows with aug > 0, same stripe rules as
+    _apply_specaugment). No learnable parameters, run without autograd and
+    outside autocast (FFTs stay float32). The CQT kernels are non-persistent
+    buffers, rebuilt from the config, so they never enter a checkpoint."""
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        sr = cfg["sample_rate"]
+        self.pad_s = cfg["cqt_pad_s"]
+        self.win_s = cfg["snippet_length_s"]
+        total_s = self.win_s + 2 * self.pad_s
+        self.block = int(round(total_s * sr))
+        self.freq_bins, self.time_bins = cfg["freq_bins"], cfg["time_bins"]
+        self.chunk = int(cfg.get("cqt_chunk", 4))
+        self.spec_augment = cfg.get("spec_augment", True)
+        self.max_time_mask_frac = cfg.get("max_time_mask_frac", 0.10)
+        self.max_freq_mask_frac = cfg.get("max_freq_mask_frac", 0.10)
+        freqs, idx, windows = cqt_kernels(cfg["cqt_octaves"], cfg["cqt_bins_per_octave"], sr, self.block,
+                                          cfg.get("cqt_gamma_hz", 0.0))
+        self.register_buffer("freqs", freqs, persistent=False)
+        self.register_buffer("windows_range_idx", idx, persistent=False)
+        self.register_buffer("windows", windows, persistent=False)
+        # CQT output sample i of the block is at time i * total_s / L
+        L = idx.shape[1]
+        self.t0 = int(round(self.pad_s / total_s * L))
+        self.t1 = int(round((self.pad_s + self.win_s) / total_s * L))
+
+    def cqt_power(self, wave: torch.Tensor) -> torch.Tensor:
+        """(B, N) float32 -> (B, K, time_bins) CQT power of the window region."""
+        out = []
+        for w in wave.split(self.chunk):
+            crops = torch.fft.fft(w)[:, self.windows_range_idx] * self.windows   # (b, K, L)
+            c = torch.fft.ifft(crops)
+            p = (c.real ** 2 + c.imag ** 2)[..., self.t0:self.t1]
+            out.append(F.adaptive_avg_pool1d(p, self.time_bins))
+        return torch.cat(out)
+
+    def _spec_augment(self, x: torch.Tensor, aug: torch.Tensor) -> torch.Tensor:
+        drop_t = int(self.time_bins * self.max_time_mask_frac)
+        drop_f = int(self.freq_bins * self.max_freq_mask_frac)
+        for b, n in enumerate(aug.tolist()):
+            for _ in range(int(n)):
+                if torch.randint(0, 2, (1,)).item() == 0:
+                    d = torch.randint(0, max(drop_t, 1), (1,)).item()
+                    s = torch.randint(0, self.time_bins - d, (1,)).item()
+                    x[b, :, :, s:s + d] = 0
+                else:
+                    d = torch.randint(0, max(drop_f, 1), (1,)).item()
+                    s = torch.randint(0, self.freq_bins - d, (1,)).item()
+                    x[b, :, s:s + d, :] = 0
+        return x
+
+    @torch.no_grad()
+    def forward(self, wave: torch.Tensor, aug: torch.Tensor = None) -> torch.Tensor:
+        with torch.autocast(device_type=wave.device.type, enabled=False):
+            wave = wave.float().reshape(wave.shape[0], -1)
+            if wave.shape[1] != self.block:
+                raise ValueError(f"CQTFrontend expects {self.block} samples per window, got {wave.shape[1]}")
+            x = torch.log10(self.cqt_power(wave) + 1e-12).unsqueeze(1)          # (B, 1, K, T)
+            x = F.interpolate(x, size=(self.freq_bins, self.time_bins), mode="bilinear", align_corners=False)
+            lo = x.amin(dim=(1, 2, 3), keepdim=True)
+            hi = x.amax(dim=(1, 2, 3), keepdim=True)
+            x = (x - lo) / (hi - lo + 1e-12)
+            if self.training and self.spec_augment and aug is not None:
+                x = self._spec_augment(x, aug)
+        return x
+
+
+def cqt_spectrogram_db(waveform: torch.Tensor, cfg: dict = None, device=None):
+    """Display spectrogram of arbitrary-length audio (already at cfg's sample
+    rate), computed the way the model sees it: consecutive snippet_length_s
+    windows, each with cqt_pad_s of neighbouring audio (zeros at the file
+    edges) on both sides, through CQTFrontend.cqt_power -- but without the
+    resize to freq_bins and the min-max. Returns (spec_db (1, K, T) tensor in
+    dB, freqs (K,) numpy array in Hz); T = time_bins columns per window,
+    trimmed to the audio's duration. Used by the plot scripts."""
+    cfg = cfg or BAND_CONFIG["cqt"]
+    fe = CQTFrontend(cfg).to(device or "cpu")
+    sr = cfg["sample_rate"]
+    win = int(round(cfg["snippet_length_s"] * sr))
+    pad = int(round(cfg["cqt_pad_s"] * sr))
+    x = waveform.reshape(-1).float()
+    n_win = max(1, int(np.ceil(len(x) / win)))
+    padded = F.pad(x, (pad, pad + n_win * win - len(x)))
+    windows = torch.stack([padded[i * win: i * win + win + 2 * pad] for i in range(n_win)])
+    with torch.no_grad():
+        p = fe.cqt_power(windows.to(fe.windows.device)).cpu()        # (n_win, K, time_bins)
+    p = p.permute(1, 0, 2).reshape(p.shape[1], -1)
+    n_cols = max(1, int(round(len(x) / win * cfg["time_bins"])))
+    return (10.0 * torch.log10(p[:, :n_cols] + 1e-12)).unsqueeze(0), fe.freqs.cpu().numpy()
 
 
 # --------------------------------------------------------------------------
@@ -1485,6 +1483,12 @@ def compute_class_weights(df_anno_train: pd.DataFrame, file_stems, audio_index: 
 # --------------------------------------------------------------------------
 
 class ImprovedCNNBiGRU(nn.Module):
+    """v17: CQTFrontend -> ONE CNN stem -> BiGRU (+ optional attention) ->
+    per-timestep classifier. Takes the dataset's {"wave", "aug"} batch and
+    returns (B, num_classes, timesteps) logits. `frontend_cfg` is the band
+    config the model is trained/loaded with (a checkpoint's "band_config";
+    BAND_CONFIG["cqt"] when not given)."""
+
     @staticmethod
     def _build_cnn_stem(in_channels, pooled_freq_rows, timesteps):
         return nn.Sequential(
@@ -1518,71 +1522,31 @@ class ImprovedCNNBiGRU(nn.Module):
             nn.Conv2d(256, 512, kernel_size=(3, 3), padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(),
-            # v7: pooled_freq_rows was a hardcoded 32 through v6, regardless
-            # of fsteps (the constructor's own `fsteps` parameter above is,
-            # in fact, entirely unused inside this class -- AdaptiveAvgPool2d
-            # already made the model shape-agnostic to input frequency
-            # height, so changing BAND_CONFIG's lf/hf/joint freq_bins values
-            # never requires touching this class at all). Raised for the
-            # joint model specifically (see BAND_CONFIG["joint"]'s own
-            # pooled_freq_rows comment for current numbers/reasoning) --
-            # left at the original 32 for standalone lf/hf.
+            # pools whatever (freq, time) size the conv stack produces to
+            # (pooled_freq_rows, timesteps) -- the model is input-size agnostic
             nn.AdaptiveAvgPool2d((pooled_freq_rows, timesteps)),
         )
 
-    def __init__(self, in_channels=1, hidden_size=512, num_classes=5, timesteps=121, fsteps=200,
-                 use_attention=False, gru_layers=3, pooled_freq_rows=32, fusion_mode="stack"):
+    def __init__(self, num_classes=11, timesteps=121, hidden_size=512, gru_layers=3,
+                 use_attention=True, pooled_freq_rows=48, frontend_cfg=None):
         super().__init__()
         self.use_attention = use_attention
         self.pooled_freq_rows = pooled_freq_rows
-        # v9: only "twotower" changes anything here -- see train_lf.py's
-        # --fusion-mode comment. Every other mode (including plain lf/hf,
-        # which never set this) behaves exactly as before: one shared CNN
-        # stem, `in_channels` already tells it 1 (stack/stack_normfix) or 2
-        # (channels).
-        self.fusion_mode = fusion_mode
-
-        if fusion_mode == "twotower":
-            # option 3: separate CNN stem per sub-band -- each learns its
-            # own early filters instead of a shared stem whose first conv
-            # layer would otherwise convolve across the physically
-            # meaningless LF/HF frequency seam "stack" creates. Fused only
-            # after each tower's own pooled features are flattened, right
-            # before the GRU (see forward()).
-            self.cnn_hf = self._build_cnn_stem(1, pooled_freq_rows, timesteps)
-            self.cnn_lf = self._build_cnn_stem(1, pooled_freq_rows, timesteps)
-            gru_input_size = 512 * pooled_freq_rows * 2
-        else:
-            self.cnn = self._build_cnn_stem(in_channels, pooled_freq_rows, timesteps)
-            gru_input_size = 512 * pooled_freq_rows
+        self.frontend = CQTFrontend(frontend_cfg or BAND_CONFIG["cqt"])
+        self.cnn = self._build_cnn_stem(1, pooled_freq_rows, timesteps)
 
         self.gru = nn.GRU(
-            input_size=gru_input_size,
+            input_size=512 * pooled_freq_rows,
             hidden_size=hidden_size,
             num_layers=gru_layers,
             batch_first=True,
             bidirectional=True,
             dropout=0.3 if gru_layers > 1 else 0.0,
         )
-
-        # This constructor's own default is False (unused in practice --
-        # every real caller passes use_attention explicitly: run_training
-        # from args.use_attention, predict_eval.py/run_inference.py/
-        # plot_errors.py from the checkpoint's saved value). The actual
-        # train_lf.py/train_hf.py CLI default is True as of v4 (see
-        # README's "v4 changes") -- --no-attention reverts to a plain
-        # BiGRU. A 3-layer BiGRU is already a lot of temporal capacity for
-        # the amount of training data here (a few hundred to a few
-        # thousand positive windows per class), so the attention block's
-        # extra parameters were an overfitting-risk concern in v3, but that
-        # was never actually A/B'd cleanly -- every v3 attention run was
-        # confounded by the threshold-calibration and WEAK-annotation bugs
-        # "v3 changes" #11/#15 later found and fixed.
         if use_attention:
             self.attention = nn.MultiheadAttention(
                 embed_dim=hidden_size * 2, num_heads=8, dropout=0.2, batch_first=True,
             )
-
         self.classifier = nn.Sequential(
             nn.Dropout(0.5),
             nn.Linear(hidden_size * 2, hidden_size),
@@ -1591,27 +1555,43 @@ class ImprovedCNNBiGRU(nn.Module):
             nn.Linear(hidden_size, num_classes),
         )
 
-    def _cnn_to_seq(self, feat, batch_size):
-        feat = feat.permute(0, 3, 1, 2)
-        return feat.reshape(batch_size, feat.size(1), -1)
-
     def forward(self, x):
-        if self.fusion_mode == "twotower":
-            batch_size = x["hf"].size(0)
-            hf_seq = self._cnn_to_seq(self.cnn_hf(x["hf"]), batch_size)
-            lf_seq = self._cnn_to_seq(self.cnn_lf(x["lf"]), batch_size)
-            x = torch.cat([hf_seq, lf_seq], dim=-1)
-        else:
-            batch_size = x.size(0)
-            x = self._cnn_to_seq(self.cnn(x), batch_size)
+        x = self.frontend(x["wave"], x.get("aug"))                  # (B, 1, freq_bins, time_bins)
+        feat = self.cnn(x).permute(0, 3, 1, 2)                       # (B, timesteps, 512, pooled_freq_rows)
+        x = feat.reshape(feat.size(0), feat.size(1), -1)
         gru_out, _ = self.gru(x)
         if self.use_attention:
             attn_out, _ = self.attention(gru_out, gru_out, gru_out)
             x = gru_out + attn_out
         else:
             x = gru_out
-        x = self.classifier(x)
-        return x.permute(0, 2, 1)
+        return self.classifier(x).permute(0, 2, 1)
+
+
+def build_model(band_config: dict, num_classes: int, use_attention: bool) -> "ImprovedCNNBiGRU":
+    """The one place a model is constructed from a band config (run_training
+    with BAND_CONFIG["cqt"]; eval/inference/plot scripts with a checkpoint's
+    saved "band_config")."""
+    return ImprovedCNNBiGRU(
+        num_classes=num_classes,
+        timesteps=int(band_config["snippet_length_s"] / band_config["label_interval_s"]) + 1,
+        hidden_size=band_config["hidden_size"],
+        gru_layers=band_config.get("gru_layers", 3),
+        use_attention=use_attention,
+        pooled_freq_rows=band_config.get("pooled_freq_rows", 48),
+        frontend_cfg=band_config,
+    )
+
+
+def load_model_from_checkpoint(checkpoint: dict, device) -> "ImprovedCNNBiGRU":
+    """Rebuild + load a v17 checkpoint (architecture and label list as saved)."""
+    if checkpoint.get("fusion_mode", "cqt") != "cqt" or "cqt_octaves" not in checkpoint.get("band_config", {}):
+        raise SystemExit("ERROR: not a v17 (CQT single-tower) checkpoint -- use the v13 code for "
+                         "joint/twotower checkpoints.")
+    model = build_model(checkpoint["band_config"], len(checkpoint["model_labels"]),
+                        checkpoint.get("use_attention", False)).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model.eval()
 
 
 # --------------------------------------------------------------------------
@@ -1626,7 +1606,7 @@ class WeightedFocalLoss(nn.Module):
         self.gamma = gamma
         self.reduction = reduction
 
-    def forward(self, inputs, targets):
+    def forward(self, inputs, targets, mask=None):
         bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
         pt = torch.exp(-bce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
@@ -1634,6 +1614,15 @@ class WeightedFocalLoss(nn.Module):
         if self.class_weights is not None:
             weights = self.class_weights.view(1, -1, 1).to(inputs.device)
             focal_loss = focal_loss * weights
+
+        # v13: mask (same shape as targets, 1 = counts, 0 = ignored) -- the
+        # masked mean divides by the number of COUNTED elements, so with an
+        # all-ones mask this is exactly the old .mean().
+        if mask is not None:
+            mask = mask.to(inputs.device, dtype=focal_loss.dtype)
+            focal_loss = focal_loss * mask
+            if self.reduction == "mean":
+                return focal_loss.sum() / mask.sum().clamp_min(1.0)
 
         if self.reduction == "mean":
             return focal_loss.mean()
@@ -1651,23 +1640,36 @@ class WeightedCombinedLoss(nn.Module):
         self.class_weights = class_weights
         self.bce_loss = nn.BCEWithLogitsLoss(reduction="none" if class_weights is not None else "mean")
 
-    def forward(self, inputs, targets):
-        focal = self.focal_loss(inputs, targets)
-        if self.class_weights is not None:
-            bce = self.bce_loss(inputs, targets)
-            weights = self.class_weights.view(1, -1, 1).to(inputs.device)
-            bce = (bce * weights).mean()
+    def forward(self, inputs, targets, mask=None):
+        focal = self.focal_loss(inputs, targets, mask)
+        if self.class_weights is not None or mask is not None:
+            bce = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+            if self.class_weights is not None:
+                bce = bce * self.class_weights.view(1, -1, 1).to(inputs.device)
+            if mask is not None:
+                m = mask.to(inputs.device, dtype=bce.dtype)
+                bce = (bce * m).sum() / m.sum().clamp_min(1.0)
+            else:
+                bce = bce.mean()
         else:
             bce = self.bce_loss(inputs, targets)
         return self.alpha * focal + self.beta * bce
 
 
-def compute_class_wise_f1(preds, targets, threshold=0.5, num_classes=5):
+def compute_class_wise_f1(preds, targets, threshold=0.5, num_classes=5, masks=None):
+    """Frame-level F1 per class at a fixed threshold. v13: `masks` (same shape
+    as targets) excludes masked frames from TP/FP/FN, and the macro average is
+    over classes that have at least one positive among the counted frames
+    (a class with no positives in this split can't score, and must not drag
+    the mean down as a hard 0)."""
     preds_bin = (torch.sigmoid(preds) > threshold).float()
-    f1_scores = []
+    f1_scores, supported = [], []
     for class_idx in range(num_classes):
         pred_class = preds_bin[:, class_idx, :].flatten()
         target_class = targets[:, class_idx, :].flatten()
+        if masks is not None:
+            keep = masks[:, class_idx, :].flatten() > 0.5
+            pred_class, target_class = pred_class[keep], target_class[keep]
 
         tp = (pred_class * target_class).sum().item()
         fp = (pred_class * (1 - target_class)).sum().item()
@@ -1677,8 +1679,62 @@ def compute_class_wise_f1(preds, targets, threshold=0.5, num_classes=5):
         recall = tp / (tp + fn + 1e-8)
         f1 = 2 * precision * recall / (precision + recall + 1e-8)
         f1_scores.append(f1)
+        supported.append(float(target_class.sum().item()) > 0)
 
-    return float(np.mean(f1_scores)), f1_scores
+    if masks is None:
+        return float(np.mean(f1_scores)), f1_scores
+    sup = [f for f, s in zip(f1_scores, supported) if s]
+    return (float(np.mean(sup)) if sup else 0.0), f1_scores
+
+
+MIN_VAL_POSITIVE_BINS = 20   # a class needs this many positive 0.5 s bins in val to enter the macro score
+
+
+def masked_class_metrics(logits, targets, masks=None, threshold=0.5, min_pos=None):
+    """v13 validation metrics, computed ONLY on frames where the class is in
+    scope (masks == 1):
+
+      ap      -- per-class average precision (threshold-free, robust to the
+                 extreme class imbalance); NaN for a class with fewer than
+                 `min_pos` positive bins (too few to score reliably).
+      f1      -- per-class F1 at `threshold` (kept for continuity with v12).
+      macro_ap / macro_f1 -- means over the supported classes only.
+
+    macro_ap is the model-selection / LR-scheduler / early-stopping score in
+    run_training (v12 used the unweighted mean F1@0.5 over all classes)."""
+    from sklearn.metrics import average_precision_score
+    min_pos = MIN_VAL_POSITIVE_BINS if min_pos is None else min_pos
+    probs = torch.sigmoid(logits)
+    C = logits.shape[1]
+    ap, f1, n_pos, n_valid = [], [], [], []
+    for c in range(C):
+        y = targets[:, c, :].reshape(-1)
+        p = probs[:, c, :].reshape(-1)
+        if masks is not None:
+            keep = masks[:, c, :].reshape(-1) > 0.5
+            y, p = y[keep], p[keep]
+        npos = int((y > 0.5).sum().item())
+        n_pos.append(npos)
+        n_valid.append(int(y.numel()))
+        pred = p > threshold
+        pos = y > 0.5
+        tp = float((pred & pos).sum().item())
+        fp = float((pred & ~pos).sum().item())
+        fn = float((~pred & pos).sum().item())
+        prec = tp / (tp + fp + 1e-8)
+        rec = tp / (tp + fn + 1e-8)
+        f1.append(2 * prec * rec / (prec + rec + 1e-8))
+        if npos >= min_pos and npos < y.numel():
+            ap.append(float(average_precision_score(pos.numpy().astype(np.uint8), p.numpy())))
+        else:
+            ap.append(float("nan"))
+    ap_arr = np.array(ap, dtype=float)
+    sup_f1 = [f for f, n in zip(f1, n_pos) if n > 0]
+    return {
+        "ap": ap, "f1": f1, "n_pos": n_pos, "n_valid": n_valid,
+        "macro_ap": float(np.nanmean(ap_arr)) if np.isfinite(ap_arr).any() else 0.0,
+        "macro_f1": float(np.mean(sup_f1)) if sup_f1 else 0.0,
+    }
 
 
 def smooth_binary_predictions(binary_seq: np.ndarray, min_duration_bins: int = 1,
@@ -2026,20 +2082,33 @@ def run_inference_continuous_singleprocess(model, dataset, device, batch_size: i
 # Training / validation loops
 # --------------------------------------------------------------------------
 
+def _unpack_batch(batch, device):
+    """v13: loaders built with return_mask=True yield (x, y, mask); older
+    (x, y) loaders still work (mask=None)."""
+    if len(batch) == 3:
+        x, y, m = batch
+        return _to_device(x, device), y.to(device, non_blocking=True), m.to(device, non_blocking=True)
+    x, y = batch
+    return _to_device(x, device), y.to(device, non_blocking=True), None
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch, num_classes,
                      scaler=None):
+    """Returns a dict: loss, f1 (masked macro F1@0.5, supported classes only),
+    class_f1. (AP is only computed in validate -- on the training stream it
+    would be both slow and distorted by the rare-class sampler.)"""
     model.train()
     total_loss = 0
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_masks = [], [], []
 
-    for x, y in tqdm(loader, desc=f"Epoch {epoch} train"):
-        x, y = _to_device(x, device), y.to(device, non_blocking=True)
+    for batch in tqdm(loader, desc=f"Epoch {epoch} train"):
+        x, y, m = _unpack_batch(batch, device)
 
         optimizer.zero_grad()
         if scaler is not None:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 outputs = model(x)
-                loss = criterion(outputs, y)
+                loss = criterion(outputs, y, m)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -2047,46 +2116,57 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, num_clas
             scaler.update()
         else:
             outputs = model(x)
-            loss = criterion(outputs, y)
+            loss = criterion(outputs, y, m)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         total_loss += loss.item()
-        all_preds.append(outputs.detach().cpu())
+        all_preds.append(outputs.detach().float().cpu())
         all_targets.append(y.detach().cpu())
+        if m is not None:
+            all_masks.append(m.detach().cpu())
 
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
-    avg_f1, class_f1s = compute_class_wise_f1(all_preds, all_targets, num_classes=num_classes)
-    return total_loss / len(loader), avg_f1, class_f1s
+    all_masks = torch.cat(all_masks, dim=0) if all_masks else None
+    avg_f1, class_f1s = compute_class_wise_f1(all_preds, all_targets, num_classes=num_classes, masks=all_masks)
+    return {"loss": total_loss / len(loader), "f1": avg_f1, "class_f1": class_f1s}
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, num_classes):
+def validate(model, loader, criterion, device, num_classes, min_pos=None):
+    """Returns the masked_class_metrics dict plus 'loss'."""
     model.eval()
     total_loss = 0
-    all_preds, all_targets = [], []
+    all_preds, all_targets, all_masks = [], [], []
 
-    for x, y in tqdm(loader, desc="Validation"):
-        x, y = _to_device(x, device), y.to(device, non_blocking=True)
+    for batch in tqdm(loader, desc="Validation"):
+        x, y, m = _unpack_batch(batch, device)
         outputs = model(x)
-        loss = criterion(outputs, y)
+        loss = criterion(outputs, y, m)
         total_loss += loss.item()
-        all_preds.append(outputs.cpu())
+        all_preds.append(outputs.float().cpu())
         all_targets.append(y.cpu())
+        if m is not None:
+            all_masks.append(m.cpu())
 
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
-    avg_f1, class_f1s = compute_class_wise_f1(all_preds, all_targets, num_classes=num_classes)
-    return total_loss / len(loader), avg_f1, class_f1s
+    all_masks = torch.cat(all_masks, dim=0) if all_masks else None
+    res = masked_class_metrics(all_preds, all_targets, all_masks, min_pos=min_pos)
+    res["loss"] = total_loss / len(loader)
+    return res
 
 
 def run_training(band: str, args):
-    """Shared entrypoint used by train_lf.py / train_hf.py. `args` is an
-    argparse.Namespace; see those scripts for the accepted fields."""
+    """Training entrypoint (train_cqt.py). `args` is an argparse.Namespace from
+    somad_args.build_argparser/resolve_defaults; `band` is "cqt" (the only one)."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Band: {band} | device: {device}")
+    if getattr(args, "class_config", None):
+        configure_classes(args.class_config)
+    print(f"Classes ({len(BAND_LABELS[band])}): {BAND_LABELS[band]}")
 
     audio_dirs = resolve_audio_dirs(args, band)
     df_anno, audio_index = build_dataset_table(
@@ -2096,8 +2176,11 @@ def run_training(band: str, args):
     )
     print(f"Found {len(audio_index)} audio files, {len(df_anno)} usable annotations")
     print(df_anno["label"].value_counts())
+    n_unc = int(df_anno["mask_label"].notna().sum()) if "mask_label" in df_anno.columns else 0
+    if n_unc:
+        print(f"{n_unc} 'uncertain' annotation rows -> their bins are masked for the class, not negatives")
 
-    train_stems, val_stems = split_files(audio_index, val_fraction=args.val_fraction, seed=args.seed)
+    train_stems, val_stems = get_split(args, audio_index, df_anno)
     print(f"Train files: {len(train_stems)} | Val files: {len(val_stems)}")
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -2106,15 +2189,21 @@ def run_training(band: str, args):
     with open(os.path.join(args.output_dir, "val_files.txt"), "w") as f:
         f.write("\n".join(val_stems))
 
+    # v13: what each class actually has to learn from / be scored on, per
+    # split (unique positive 0.5 s bins, scope-aware) -- also in the run log.
+    try:
+        _print_split_class_bins(df_anno, train_stems, val_stems, audio_index, BAND_LABELS[band])
+    except Exception as exc:  # never let a reporting helper kill a long job
+        print(f"(class/bin summary skipped: {exc!r})")
+
     bluefin_hf_dir = getattr(args, "bluefin_hf_dir", None)
-    # v9: only meaningful for band="joint" -- PamSequenceDataset defaults
-    # to "stack" (the v7/v8 behavior) when not band="joint", same as if
-    # this were never passed.
-    fusion_mode = getattr(args, "fusion_mode", "stack")
+    noise_pool_size = getattr(args, "noise_pool_size", NOISE_POOL_SIZE)
     train_set = PamSequenceDataset(train_stems, audio_index, df_anno, band=band, augment=True,
-                                    bluefin_hf_dir=bluefin_hf_dir, fusion_mode=fusion_mode)
+                                    bluefin_hf_dir=bluefin_hf_dir,
+                                    noise_pool_size=noise_pool_size, return_mask=True)
     val_set = PamSequenceDataset(val_stems, audio_index, df_anno, band=band, augment=False,
-                                  bluefin_hf_dir=bluefin_hf_dir, fusion_mode=fusion_mode)
+                                  bluefin_hf_dir=bluefin_hf_dir,
+                                  noise_pool_size=noise_pool_size, return_mask=True)
 
     label_list = BAND_LABELS[band]
     df_anno_train = df_anno[df_anno["stem"].isin(train_stems)]
@@ -2139,14 +2228,18 @@ def run_training(band: str, args):
     # class; background-only windows keep weight 1.0 so they're still seen,
     # just not as the overwhelming majority every epoch.
     sample_weights = 1.0 + train_set.class_presence.astype(np.float32) @ class_weights.numpy()
+    # v13: per-source draw multiplier (class_config.json -> sample_weight),
+    # e.g. keep the 17k-box DCLDE-CRP set from dominating every batch.
+    src_w = {s: CLASS_CFG.sample_weight(CLASS_CFG.source_of(s, audio_index.get(s))) for s in train_stems}
+    sample_weights = sample_weights * train_set.df_data["stem"].map(src_w).fillna(1.0).to_numpy(dtype=np.float32)
     sampler = torch.utils.data.WeightedRandomSampler(
         weights=sample_weights, num_samples=len(train_set), replacement=True
     )
 
     # Same worker-thread-oversubscription fix as run_inference_continuous's
-    # own DataLoader -- see _worker_init_single_thread's docstring. Matters
-    # here regardless of training running on GPU: the audio decode/
-    # spectrogram preprocessing this caps is CPU work either way.
+    # own DataLoader -- see _worker_init_single_thread's docstring. v17: the
+    # workers only decode audio (+ resample/dither if needed) and apply the
+    # waveform augmentation; the spectrogram is computed by the model.
     _worker_init = _worker_init_single_thread if args.num_workers > 0 else None
     train_loader = DataLoader(train_set, batch_size=args.batch_size, sampler=sampler,
                                num_workers=args.num_workers, pin_memory=True, drop_last=True,
@@ -2155,23 +2248,12 @@ def run_training(band: str, args):
                              num_workers=args.num_workers, pin_memory=True,
                              worker_init_fn=_worker_init)
 
-    # v9: --fusion-mode=channels needs 2 input channels (both sub-bands
-    # stacked as channels instead of extra frequency rows); twotower
-    # ignores in_channels entirely (each of its 2 towers is hardcoded to 1,
-    # see ImprovedCNNBiGRU._build_cnn_stem calls). Every other case
-    # (including plain lf/hf) is the original single-channel spectrogram.
-    in_channels = 2 if (band == "joint" and fusion_mode == "channels") else 1
-    model = ImprovedCNNBiGRU(
-        in_channels=in_channels,
-        num_classes=len(label_list),
-        timesteps=timesteps_for_band(band),
-        fsteps=BAND_CONFIG[band]["freq_bins"],
-        hidden_size=BAND_CONFIG[band]["hidden_size"],
-        gru_layers=BAND_CONFIG[band]["gru_layers"],
-        use_attention=args.use_attention,
-        pooled_freq_rows=BAND_CONFIG[band].get("pooled_freq_rows", 32),
-        fusion_mode=fusion_mode,
-    ).to(device)
+    # v17: CQTFrontend (spectrogram on the GPU) -> one CNN tower -> BiGRU.
+    model = build_model(BAND_CONFIG[band], len(label_list), args.use_attention).to(device)
+    print(f"Model: CQT {BAND_CONFIG[band]['cqt_octaves']} oct x {BAND_CONFIG[band]['cqt_bins_per_octave']}/oct, "
+          f"gamma {BAND_CONFIG[band]['cqt_gamma_hz']} Hz -> {BAND_CONFIG[band]['freq_bins']} x "
+          f"{BAND_CONFIG[band]['time_bins']} input, single CNN tower, "
+          f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f} M parameters")
 
     criterion = WeightedCombinedLoss(class_weights=class_weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
@@ -2213,15 +2295,10 @@ def run_training(band: str, args):
             raise SystemExit(f"ERROR: {resume_path}'s label list {checkpoint.get('model_labels')} doesn't "
                               f"match this run's {label_list} -- not resumable (a different class set is a "
                               f"different model, not a continuation of this one).")
-        # v9: a different fusion_mode is a different architecture (channels
-        # has in_channels=2, twotower has two separate CNN stems instead of
-        # one) -- model.load_state_dict below would already fail on most
-        # such mismatches with a shape/key error, but check explicitly for
-        # a clearer message (and to catch the rare shape-compatible case).
-        if checkpoint.get("fusion_mode", "stack") != fusion_mode:
-            raise SystemExit(f"ERROR: {resume_path} was trained with fusion_mode="
-                              f"{checkpoint.get('fusion_mode', 'stack')!r}, cannot resume as "
-                              f"fusion_mode={fusion_mode!r} -- these are different architectures.")
+        # v17: the CQT/input settings are part of the architecture
+        if checkpoint.get("band_config") != BAND_CONFIG[band]:
+            raise SystemExit(f"ERROR: {resume_path} was trained with band_config {checkpoint.get('band_config')}, "
+                              f"this run uses {BAND_CONFIG[band]} -- not resumable.")
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -2233,32 +2310,141 @@ def run_training(band: str, args):
         print(f"Resumed at epoch {epoch_start}, best_val_f1={best_val_f1:.4f}, "
               f"patience_counter={patience_counter}/{args.patience}")
 
+    # v12: --resume-add-classes -- a DIFFERENT operation from --resume
+    # above, not a variant of it: this warm-starts a NEW training phase
+    # (fresh optimizer/scheduler/epoch-count/best-val-f1/patience, since
+    # adding classes genuinely changes the loss landscape -- the old run's
+    # best_val_f1 isn't comparable to this one's) from an OLD checkpoint
+    # trained on a SUBSET of this run's current label_list. Mutually
+    # exclusive with --resume (which requires an IDENTICAL class set and
+    # continues the exact same training run, unchanged above).
+    #
+    # Mechanism: every parameter except the classifier's final Linear layer
+    # has a shape that depends only on hidden_size/gru_layers/
+    # pooled_freq_rows/use_attention -- NOT on num_classes -- so the whole
+    # CNN towers + BiGRU + attention load unchanged regardless of how many
+    # classes were added. Only the classifier's last Linear layer's output
+    # dimension actually depends on num_classes; its rows are copied over
+    # by NAME (not position), since a new class inserted in the MIDDLE of
+    # JOINT_LABELS (e.g. added to LF_LABELS) shifts every later class's
+    # index -- position-based copying would silently scramble which row
+    # means which class. New classes' rows are left at the classifier's
+    # own fresh random init (nothing to warm-start them from).
+    #
+    # Optimizer/scheduler state is NOT restored (unlike --resume) -- AdamW's
+    # per-parameter momentum/variance buffers are tied to the OLD
+    # classifier tensor's exact shape/identity, which no longer exists once
+    # that layer's output dimension changes; starting the new, larger
+    # classifier's optimizer state fresh is the standard, expected approach
+    # for incremental-class fine-tuning, not a shortcut taken here.
+    resume_add_classes_path = getattr(args, "resume_add_classes", None)
+    if resume_add_classes_path:
+        if resume_path:
+            raise SystemExit("ERROR: --resume and --resume-add-classes are mutually exclusive -- "
+                              "--resume continues an identical-architecture/identical-class-set run; "
+                              "--resume-add-classes starts a NEW training phase warm-started from an "
+                              "old, smaller class set.")
+        old_checkpoint = torch.load(resume_add_classes_path, map_location=device, weights_only=False)
+        if old_checkpoint.get("band") != band:
+            raise SystemExit(f"ERROR: {resume_add_classes_path} was trained as band="
+                              f"{old_checkpoint.get('band')!r}, this run is band={band!r} -- these are "
+                              f"different models.")
+        if old_checkpoint.get("band_config") != BAND_CONFIG[band]:
+            raise SystemExit(f"ERROR: {resume_add_classes_path} was trained with band_config "
+                              f"{old_checkpoint.get('band_config')}, this run uses {BAND_CONFIG[band]} -- a "
+                              f"different input/architecture, not just a class-set change.")
+        old_label_list = old_checkpoint.get("model_labels", [])
+        missing = [lb for lb in old_label_list if lb not in label_list]
+        if missing:
+            raise SystemExit(f"ERROR: {resume_add_classes_path}'s classes {missing} are not present in "
+                              f"this run's current label list ({label_list}) -- --resume-add-classes "
+                              f"only supports ADDING classes, not removing or renaming existing ones.")
+        new_classes = [lb for lb in label_list if lb not in old_label_list]
+        if not new_classes:
+            print(f"WARNING: {resume_add_classes_path}'s classes already match this run's label list "
+                  f"exactly -- nothing to add. Consider --resume instead if you meant to continue this "
+                  f"exact run.")
+        print(f"Expanding from {len(old_label_list)} to {len(label_list)} classes -- new: {new_classes}")
+
+        old_state = old_checkpoint["model_state_dict"]
+        new_state = model.state_dict()
+        # Shape-mismatched keys, derived rather than hardcoded (e.g.
+        # "classifier.4.*") so this keeps working if the classifier head's
+        # own internal structure ever changes -- anything whose shape
+        # differs between the old and new state dicts is, by construction,
+        # exactly the num_classes-dependent final layer and nothing else
+        # (every other parameter's shape is independent of num_classes).
+        mismatched_keys = {k for k in old_state if k in new_state and old_state[k].shape != new_state[k].shape}
+        compatible_state = {k: v for k, v in old_state.items() if k not in mismatched_keys}
+        missing_keys, unexpected_keys = model.load_state_dict(compatible_state, strict=False)
+        truly_missing = set(missing_keys) - mismatched_keys
+        if truly_missing or unexpected_keys:
+            raise SystemExit(f"ERROR: {resume_add_classes_path} isn't architecturally compatible beyond "
+                              f"the classifier's final layer -- missing {truly_missing}, unexpected "
+                              f"{unexpected_keys}. --resume-add-classes only handles a changed class "
+                              f"count, not other architecture differences (hidden_size, gru_layers, "
+                              f"pooled_freq_rows, use_attention, ...) -- those need --resume (identical "
+                              f"architecture) or training from scratch.")
+        if not mismatched_keys:
+            print("WARNING: no shape-mismatched classifier keys found -- old and new models may have "
+                  "the exact same num_classes already (see the 'nothing to add' warning above).")
+        else:
+            final_weight_key = next(k for k in mismatched_keys if k.endswith(".weight"))
+            final_bias_key = next(k for k in mismatched_keys if k.endswith(".bias"))
+            with torch.no_grad():
+                new_weight = new_state[final_weight_key]
+                new_bias = new_state[final_bias_key]
+                old_weight = old_state[final_weight_key]
+                old_bias = old_state[final_bias_key]
+                for old_idx, lb in enumerate(old_label_list):
+                    new_idx = label_list.index(lb)
+                    new_weight[new_idx].copy_(old_weight[old_idx])
+                    new_bias[new_idx].copy_(old_bias[old_idx])
+            model.load_state_dict(new_state)
+            print(f"Warm-started {len(old_label_list)}/{len(label_list)} classifier rows from "
+                  f"{resume_add_classes_path}; {len(new_classes)} new class row(s) left at random init. "
+                  f"Starting fresh optimizer/scheduler/epoch count (epoch 1) -- this is a new training "
+                  f"phase, not a continuation.")
+
+    # v13: selection metric = masked macro average precision over the classes
+    # with >= --min-val-positives positive bins in the validation split (see
+    # masked_class_metrics). F1@0.5 stays in the log for continuity with v12.
+    min_val_pos = getattr(args, "min_val_positives", MIN_VAL_POSITIVE_BINS)
     log_file = os.path.join(args.output_dir, f"{args.run_name}.csv")
     if not (resume_path and os.path.exists(log_file)):
         with open(log_file, mode="w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "train_loss", "train_f1", "val_loss", "val_f1", "lr"])
+            writer.writerow(["epoch", "train_loss", "train_f1", "val_loss", "val_f1", "val_macro_ap", "lr"]
+                            + [f"val_ap__{lb}" for lb in label_list] + [f"val_f1__{lb}" for lb in label_list])
 
     for epoch in range(epoch_start, args.epochs + 1):
-        train_loss, train_f1, _ = train_one_epoch(
+        tr = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
             num_classes=len(label_list), scaler=scaler,
         )
-        val_loss, val_f1, val_class_f1s = validate(model, val_loader, criterion, device,
-                                                     num_classes=len(label_list))
-        scheduler.step(val_f1)
+        va = validate(model, val_loader, criterion, device, num_classes=len(label_list), min_pos=min_val_pos)
+        train_loss, train_f1 = tr["loss"], tr["f1"]
+        val_loss, val_f1, val_ap = va["loss"], va["macro_f1"], va["macro_ap"]
+        val_class_f1s, val_class_ap = va["f1"], va["ap"]
+        # fall back to F1 only if NO class had enough validation positives for AP
+        val_score = val_ap if np.isfinite(np.array(val_class_ap)).any() else val_f1
+        scheduler.step(val_score)
         current_lr = optimizer.param_groups[0]["lr"]
 
         print(f"\nEpoch {epoch} | train_loss={train_loss:.4f} train_f1={train_f1:.4f} "
-              f"| val_loss={val_loss:.4f} val_f1={val_f1:.4f} | lr={current_lr:.2e}")
-        print("Val class F1s:", dict(zip(label_list, [round(f, 3) for f in val_class_f1s])))
+              f"| val_loss={val_loss:.4f} val_macro_AP={val_ap:.4f} (select) val_f1@0.5={val_f1:.4f} "
+              f"| lr={current_lr:.2e}")
+        print("Val class AP:", {lb: (None if np.isnan(a) else round(a, 3)) for lb, a in zip(label_list, val_class_ap)})
+        print("Val class F1@0.5:", dict(zip(label_list, [round(f, 3) for f in val_class_f1s])))
+        print("Val positive bins:", dict(zip(label_list, va["n_pos"])))
 
         with open(log_file, mode="a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([epoch, train_loss, train_f1, val_loss, val_f1, current_lr])
+            writer.writerow([epoch, train_loss, train_f1, val_loss, val_f1, val_ap, current_lr]
+                            + [("" if np.isnan(a) else a) for a in val_class_ap] + list(val_class_f1s))
 
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        if val_score > best_val_f1:
+            best_val_f1 = val_score
             patience_counter = 0
         else:
             patience_counter += 1
@@ -2277,24 +2463,34 @@ def run_training(band: str, args):
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
             "epoch": epoch,
+            # v13: "best_f1" kept as the key name every v12 script/resume path
+            # reads, but it now holds the SELECTION score (masked macro AP);
+            # selection_metric says so explicitly. val_f1_at_epoch is the old
+            # F1@0.5 of this epoch.
             "best_f1": best_val_f1,
+            "selection_metric": "masked_macro_average_precision",
+            "val_f1_at_epoch": val_f1,
+            "class_ap": val_class_ap,
+            "min_val_positive_bins": min_val_pos,
+            "class_config": CLASS_CFG.raw,
             "patience_counter": patience_counter,
             "class_f1s": val_class_f1s,
             "band": band,
-            "model_labels": label_list,
+            "model_labels": list(label_list),
             "band_config": BAND_CONFIG[band],
             "use_attention": args.use_attention,
             "rare_classes": rare_classes,
-            "fusion_mode": fusion_mode,
+            "fusion_mode": "cqt",   # v17: kept so v13-era scripts can tell this checkpoint apart
+            "resume_add_classes_from": getattr(args, "resume_add_classes", None),
         }
         torch.save(checkpoint_dict, os.path.join(args.output_dir, "latest_checkpoint.pth"))
 
         if patience_counter == 0:  # i.e. this epoch WAS the new best (see above)
             torch.save(checkpoint_dict, os.path.join(args.output_dir, "best_model.pth"))
-            print(f"Saved new best model, val_f1={best_val_f1:.4f}")
+            print(f"Saved new best model, val_macro_AP={best_val_f1:.4f}")
 
         if patience_counter >= args.patience:
             print(f"Early stopping after {args.patience} epochs without improvement")
             break
 
-    print(f"Training done. Best val F1: {best_val_f1:.4f}")
+    print(f"Training done. Best val macro AP: {best_val_f1:.4f}")

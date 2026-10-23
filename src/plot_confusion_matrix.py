@@ -36,24 +36,25 @@ with raw-score tie-breaking (it's not a tie-breaking problem, it really
 does cross its own threshold almost everywhere), drowning out the more
 meaningful cross-class confusion in the combined plot; and its own
 precision/recall are already known to be near-meaningless at this sample
-size, so there's little reason to keep it cluttering the per-class grid
-either while it's this data-starved. Pass --exclude-labels with no
-arguments to see every class in both plots.
+size (see README's "Rare-class handling"), so there's little reason to
+keep it cluttering the per-class grid either while it's this data-starved.
+Pass --exclude-labels with no arguments to see every class in both plots.
 
 Uses the SAME continuous-timeline stitching (common.run_inference_continuous)
-and expects the same CONTINUOUS-calibrated thresholds as the rest of this
-pipeline (window-calibrated thresholds are measurably too permissive
-against continuous-stitched scores) -- pass thresholds_<band>_continuous.csv,
-not the plain thresholds_<band>.csv.
+and expects the same CONTINUOUS-calibrated thresholds as the rest of the
+deployment pipeline (see README's "v3 changes" #9/#11/#12 for why --
+window-calibrated thresholds are measurably too permissive against
+continuous-stitched scores) -- pass thresholds_<band>_continuous.csv, not
+the plain thresholds_<band>.csv.
 
 Also saves the raw counts behind both plots as CSVs.
 
-Usage (SOMAD, the published joint model):
+Usage (nautilus, in Docker -- see run_nautilus_confusion_matrix.sh):
 
-    python plot_confusion_matrix.py --band joint \
-        --checkpoint checkpoints/best_model.pth \
-        --thresholds-csv checkpoints/thresholds_joint_continuous.csv \
-        --output-dir confmat_joint
+    python plot_confusion_matrix.py \
+        --checkpoint /output/bigru_lf/best_model.pth \
+        --thresholds-csv /output/eval_lf/thresholds_lf_continuous.csv \
+        --output-dir /output/confusion_lf
 """
 
 import argparse
@@ -69,7 +70,7 @@ from sklearn.metrics import confusion_matrix, multilabel_confusion_matrix
 from torch.utils.data import DataLoader
 
 import common
-from train_lf import build_argparser, resolve_defaults
+from somad_args import build_argparser, resolve_defaults
 
 
 def plot_per_class(all_true, all_pred, label_list, out_dir, band):
@@ -178,7 +179,7 @@ def plot_combined(all_true, all_pred, all_scores, thresholds, label_list, out_di
 
 def main():
     p = build_argparser()
-    p.add_argument("--band", choices=["lf", "hf", "joint"], required=True)
+    p.add_argument("--band", choices=["cqt"], default="cqt", help="v17 has one band, cqt (default)")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--thresholds-csv", required=True,
                     help="thresholds_<band>_continuous.csv from predict_eval.py -- always the continuous "
@@ -200,12 +201,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # common.resolve_audio_dirs (not a hand-rolled list) -- it conditionally
-    # includes --bluefin-dir for band=="lf" (see its own docstring); an LF
-    # checkpoint is trained with bluefin data by default, so its saved
-    # val_files.txt below lists bluefin stems (named after their original
-    # site, e.g. "..._kerguelen2005_...") that would otherwise KeyError
-    # against an audio_index that never included that data at all.
+    # common.resolve_audio_dirs (not a hand-rolled list): includes --bluefin-dir,
+    # whose stems the checkpoint's val_files.txt can list.
     audio_dirs = common.resolve_audio_dirs(args, band)
     df_anno, audio_index = common.build_dataset_table(args.aplose_csv, args.soi_csv, audio_dirs)
 
@@ -214,38 +211,23 @@ def main():
         with open(val_files_path) as f:
             val_stems = [l.strip() for l in f if l.strip()]
     else:
-        _, val_stems = common.split_files(audio_index, val_fraction=args.val_fraction, seed=args.seed)
+        _, val_stems = common.get_split(args, audio_index, df_anno)
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if checkpoint.get("band", band) != band:
         print(f"WARNING: checkpoint was trained as band={checkpoint.get('band')!r}, but --band={band!r} "
               f"was requested")
+    # v13: evaluate with the class set the checkpoint was TRAINED with (matters once
+    # classes have been added to class_config.json after this checkpoint was made)
+    if checkpoint.get('class_config'):
+        common.configure_classes(checkpoint['class_config'])
     label_list = checkpoint.get("model_labels", common.BAND_LABELS[band])
-    band_config = checkpoint.get("band_config", common.BAND_CONFIG[band])
     use_attention = checkpoint.get("use_attention", False)
-    fusion_mode = checkpoint.get("fusion_mode", "stack")
 
-    # fusion_mode read from the checkpoint BEFORE building val_set -- see
-    # predict_eval.py's identical comment for why (channels/twotower need
-    # a differently-shaped dataset input than the stack default).
     val_set = common.PamSequenceDataset(val_stems, audio_index, df_anno, band=band, augment=False,
-                                         bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None),
-                                         fusion_mode=fusion_mode)
+                                         bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None))
 
-    in_channels = 2 if (band == "joint" and fusion_mode == "channels") else 1
-    model = common.ImprovedCNNBiGRU(
-        in_channels=in_channels,
-        num_classes=len(label_list),
-        timesteps=common.timesteps_for_band(band),
-        fsteps=band_config["freq_bins"],
-        hidden_size=band_config["hidden_size"],
-        gru_layers=band_config.get("gru_layers", 3),
-        use_attention=use_attention,
-        pooled_freq_rows=band_config.get("pooled_freq_rows", 32),
-        fusion_mode=fusion_mode,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    model = common.load_model_from_checkpoint(checkpoint, device)   # v17: CQT single tower
     print("Checkpoint epoch:", checkpoint.get("epoch"), "val F1 at save time:", checkpoint.get("best_f1"),
           "use_attention:", use_attention)
 

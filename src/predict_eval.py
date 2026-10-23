@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Evaluate a trained checkpoint (LF, HF, or joint) on its validation
-split: runs inference over the val set, finds the best-F1 decision
-threshold per class from a precision/recall curve, and saves plots + a
-thresholds CSV.
+"""Evaluate a trained LF or HF BiGRU checkpoint on its validation split:
+runs inference over the val set, finds the best-F1 decision threshold per
+class from a precision/recall curve, and saves plots + a thresholds CSV.
 
-Thresholds are calibrated two ways and both are reported -- see the
-"window" vs "continuous" note in main() for why; always use the
-*continuous* one downstream (that's what `checkpoints/
-thresholds_joint_continuous.csv` and `run_inference.py` expect).
+v3: calibrates thresholds TWO ways and reports both, rather than silently
+picking one -- see the "window" vs "continuous" note in main() for why.
 
-Usage:
+Usage (nautilus, v2 output tree -- see README.md):
 
-    python predict_eval.py --band joint --checkpoint checkpoints/best_model.pth
+    python predict_eval.py --checkpoint /scratch/disk3/a5278/bigru_aplose/output_v5/bigru_lf/best_model.pth
+    python predict_eval.py --checkpoint /scratch/disk3/a5278/bigru_aplose/output_v5/bigru_hf/best_model.pth \
+        --output-dir /scratch/disk3/a5278/bigru_aplose/output_v5/eval_hf
 
-If running this inside Docker, pass `--shm-size=16g` (or larger) to
-`docker run` -- the default container shared-memory size is too small for
-the DataLoader workers and fails with a misleading "No space left on
-device".
+Prefer `./run_nautilus_eval.sh {lf|hf}` over calling this directly --
+it sets `--shm-size=16g`, which this needs when run in Docker (the default
+container shm is too small for the DataLoader workers and fails with a
+misleading "No space left on device").
 """
 
 import argparse
@@ -33,7 +32,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import common
-from train_lf import build_argparser, resolve_defaults
+from somad_args import build_argparser, resolve_defaults
 
 
 def fit_thresholds(y_true_2d: np.ndarray, y_pred_2d: np.ndarray, label_list, curve_points: int = 500):
@@ -130,7 +129,7 @@ def per_file_frame_metrics(continuous: dict, label_list, thresholds) -> pd.DataF
 
 def main():
     p = build_argparser()
-    p.add_argument("--band", choices=["lf", "hf", "joint"], required=True)
+    p.add_argument("--band", choices=["cqt"], default="cqt", help="v17 has one band, cqt (default)")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--no-overlap", action="store_true",
                     help="Cut windows back-to-back (snippet_overlap=1) instead of the default 50%% hop -- "
@@ -171,7 +170,7 @@ def main():
         with open(val_files_path) as f:
             val_stems = [l.strip() for l in f if l.strip()]
     else:
-        _, val_stems = common.split_files(audio_index, val_fraction=args.val_fraction, seed=args.seed)
+        _, val_stems = common.get_split(args, audio_index, df_anno)
 
     if args.exclude_bluefin:
         n_before = len(val_stems)
@@ -179,44 +178,25 @@ def main():
         print(f"--exclude-bluefin: dropped {n_before - len(val_stems)} bluefin val file(s) from the saved "
               f"split, {len(val_stems)} real APLOSE/SOI val file(s) remain")
 
-    # Read architecture/label metadata back from the checkpoint rather than
-    # from today's common.py defaults, so eval always matches whatever the
-    # checkpoint was actually trained with (band_config, use_attention,
-    # label order, fusion_mode can all drift over time as the pipeline
-    # evolves). Loaded before val_set so the dataset is built with the
-    # SAME fusion_mode the checkpoint was trained on -- "channels"/
-    # "twotower" produce a differently-shaped input than the "stack"
-    # default, so getting this wrong crashes (or silently mismatches) the
-    # very first inference call.
+    # Architecture (band_config incl. the CQT settings, use_attention) and
+    # label order come from the checkpoint, not from today's common.py.
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if checkpoint.get("band", band) != band:
         print(f"WARNING: checkpoint was trained as band={checkpoint.get('band')!r}, "
               f"but --band={band!r} was requested")
+    # v13: evaluate with the class set the checkpoint was TRAINED with (matters once
+    # classes have been added to class_config.json after this checkpoint was made)
+    if checkpoint.get('class_config'):
+        common.configure_classes(checkpoint['class_config'])
     label_list = checkpoint.get("model_labels", common.BAND_LABELS[band])
-    band_config = checkpoint.get("band_config", common.BAND_CONFIG[band])
     use_attention = checkpoint.get("use_attention", False)
-    fusion_mode = checkpoint.get("fusion_mode", "stack")
     rare_classes = set(checkpoint.get("rare_classes", []))
 
     val_set = common.PamSequenceDataset(val_stems, audio_index, df_anno, band=band, augment=False,
-                                         bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None),
-                                         fusion_mode=fusion_mode)
+                                         bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None))
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    in_channels = 2 if (band == "joint" and fusion_mode == "channels") else 1
-    model = common.ImprovedCNNBiGRU(
-        in_channels=in_channels,
-        num_classes=len(label_list),
-        timesteps=common.timesteps_for_band(band),
-        fsteps=band_config["freq_bins"],
-        hidden_size=band_config["hidden_size"],
-        gru_layers=band_config.get("gru_layers", 3),
-        use_attention=use_attention,
-        pooled_freq_rows=band_config.get("pooled_freq_rows", 32),
-        fusion_mode=fusion_mode,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    model = common.load_model_from_checkpoint(checkpoint, device)   # v17: CQT single tower
     print("Checkpoint epoch:", checkpoint.get("epoch"), "val F1 at save time:", checkpoint.get("best_f1"),
           "use_attention:", use_attention)
     if rare_classes:

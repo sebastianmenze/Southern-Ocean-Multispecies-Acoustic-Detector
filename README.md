@@ -5,6 +5,14 @@
 <h1 align="center">SOMAD</h1>
 <p align="center"><b>Southern Ocean Multispecies Acoustic Detector</b></p>
 
+> **Branch `v17-cqt-single-tower` (development, not yet trained on the full data set).**
+> The input is ONE variable-Q CQT spectrogram (11 octaves x 24 bins/octave, 7.8 Hz - 16 kHz,
+> gamma 3 Hz, resized to 500 x 600) through ONE CNN tower, computed on the GPU inside the model
+> (`src/common.py`, `CQTFrontend`), instead of the released model's two sub-band spectrograms and
+> two towers. Train with `src/train_cqt.py` or `src/run_v17_pipeline.sh`; tests in
+> `src/tests_v17.py`. See [CHANGES_v17.md](CHANGES_v17.md). The released checkpoint and the
+> instructions below refer to `main`.
+
 <p align="center">
 A joint, dual-band CNN&ndash;BiGRU sequence tagger that scores eleven co-occurring
 Southern Ocean marine mammal call types &mdash; four baleen whale call types,
