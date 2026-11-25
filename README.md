@@ -44,6 +44,7 @@ somad_v19/
 │   preview_cqt_input.py, plot_confusion_matrix.py, eval_scores.py, schall_benchmark.py,
 │   schall_benchmark_partial.py, fix_kerguelen2015_downsweep.py   helpers for the pipeline and manuscript analyses
 ├── tests_v19.py              self-tests on synthetic data (CPU)
+├── split/                    train_files.txt / val_files.txt: v19's train/validation split (file names)
 ├── checkpoints/
 │   ├── best_model.pth                    trained v19 weights (download from Zenodo, see below)
 │   └── thresholds_cqt_continuous.csv     calibrated per-class decision thresholds
@@ -162,7 +163,7 @@ events = pd.read_csv("/data/my_deployment/somad_events.csv")
 print(events["predicted_label"].value_counts())
 ```
 
-## Training on your own data and adding classes
+## Training on your own data
 
 1. **Collect the data.** Put the .wav files in `<training folder>/audio/`. Put an annotation table whose name contains `aplose` (e.g. `annotations_aplose.csv`) in `<training folder>/`. It needs one row per annotation with these columns (APLOSE result exports already have them):
 
@@ -175,40 +176,59 @@ print(events["predicted_label"].value_counts())
 
    Frequency bounds are not needed: SOMAD labels 0.5 s time bins per class. The start time of each audio file is read from its name, which must contain it as `YYYY_MM_DD_HH_MM_SS`.
 
-2. **Configure classes and sources in `class_config.json`** (next to the scripts). The released file holds the full 11-class configuration used in the paper; add new classes and sources to it.
-   - **Classes.** Each class maps one model output to one or more annotation labels. The model's outputs follow the order of `classes`; append new classes at the end.
+2. **Configure classes and sources in `class_config.json`** (next to the scripts).
+   - **Classes.** Each class maps one model output to one or more annotation labels. The model's outputs follow the order of `classes`.
    - **Uncertain labels.** Labels listed under `uncertain_labels` mask that class for the annotated time instead of counting as a positive.
    - **Sources.** `stem_source_rules` assigns files to a data source by a substring of their name. Each entry in `sources` (glob patterns allowed) sets which classes that source was annotated for in `annotated_classes`. Every other class is masked for its files, so its unannotated calls do not count as negatives. `split` is one of `random`, `train_only`, `val_only` or `ignore`. `sample_weight` scales how often the source's windows are drawn.
 
-   For example, to add a bearded seal class annotated only in one new data set:
+3. **Run the pipeline** (split, overview, train, evaluate and calibrate thresholds):
 
-   ```json
-   {
-     "classes": [
-       {"name": "Leopard seal", "aplose_labels": ["Leopard seal"]},
-       {"name": "Bearded seal", "aplose_labels": ["Bearded seal", "Erignathus trill"]}
-     ],
-     "uncertain_labels": {"Bearded seal (uncertain)": "Bearded seal"},
-     "stem_source_rules": [{"contains": "_ARCTIC01_", "source": "arctic01"}],
-     "sources": {
-       "arctic01": {"annotated_classes": ["Bearded seal"], "split": "random"}
-     },
-     "source_defaults": {"annotated_classes": "all", "split": "random", "sample_weight": 1.0}
-   }
+   ```bash
+   TRAINING_DATA_DIR=/data/my_training_set OUTPUT_DIR=/data/somad_out ./run_v19_pipeline.sh all
    ```
 
-3. **Run the pipeline:**
+   The evaluation stage writes `thresholds_cqt_continuous.csv` for the new model. Use it with `run_inference.py` as in step 1 of the worked example. You can extend the frequency range by changing the number of VQT octaves or the sample rate in `common.BAND_CONFIG["cqt"]`.
 
-```bash
-# split -> overview -> train -> evaluate and calibrate thresholds
-TRAINING_DATA_DIR=/data/my_training_set OUTPUT_DIR=/data/somad_out ./run_v19_pipeline.sh all
+## Adding classes to the released v19 model
 
-# add a class to the released model: weights are copied by class name, the new output starts fresh
-ADD_CLASSES_FROM=checkpoints/best_model.pth \
-TRAINING_DATA_DIR=/data/my_training_set OUTPUT_DIR=/data/somad_out ./run_v19_pipeline.sh train
-```
+New classes are added by continuing training from the released checkpoint (`ADD_CLASSES_FROM`). Every layer is copied from it, and the final layer's outputs are copied by class name. The new class's output starts from random weights. The new recordings and their annotation table are prepared as in step 1 above. For example, to add bearded seal recorded at a new site whose file names contain `_ARCTIC01_`:
 
-The evaluation stage writes `thresholds_cqt_continuous.csv` for the new model. Use it with `run_inference.py` as in step 1 of the worked example. You can extend the frequency range by changing the number of VQT octaves or the sample rate in `common.BAND_CONFIG["cqt"]`.
+1. **Append the new class and source to the released `class_config.json`.** Don't start a new file. All classes of the checkpoint (the 11 reported ones plus the separate "Blue whale AB call" and "Blue whale Z call" outputs) must stay in it, in the same order, because the model's outputs follow that order.
+
+   ```
+   "classes": [ ...the 13 released classes...,
+       {"name": "Bearded seal", "aplose_labels": ["Bearded seal"]} ],
+   "uncertain_labels": { ..., "Bearded seal (uncertain)": "Bearded seal" },
+   "stem_source_rules": [ ..., {"contains": "_ARCTIC01_", "source": "arctic01"} ],
+   "sources": { ...,
+       "arctic01": {"annotated_classes": ["Bearded seal", "Leopard seal", "Weddell seal",
+                                          "Crabeater seal"], "split": "random"} }
+   ```
+
+   - **The new source.** In `annotated_classes`, include every existing class the annotators also checked, or that cannot occur in the region (here the Antarctic seals). The old outputs keep learning only from such negatives.
+   - **The original sources** keep their original class lists, so the new class is masked there. A source declared with `"all"` (in the released file only `*soi*`, the South Orkney recordings) then also covers the new class, so its unannotated audio counts as negatives. That is correct when the new class cannot occur there, as for bearded seals in the Southern Ocean. Otherwise replace `"all"` by the explicit list of the original classes.
+
+2. **Split only the new files and keep the released split.** `split/train_files.txt` and `split/val_files.txt` list the files of SOMAD's original training set. Keeping them ensures that no file used to validate v19 enters training. Files listed in neither list are not used.
+
+   ```bash
+   TRAINING_DATA_DIR=/data/arctic01 OUTPUT_DIR=/data/arctic01_out ./run_v19_pipeline.sh split
+   mkdir -p /data/combined_split
+   cat split/train_files.txt /data/arctic01_out/split/train_files.txt > /data/combined_split/train_files.txt
+   cat split/val_files.txt /data/arctic01_out/split/val_files.txt > /data/combined_split/val_files.txt
+   ```
+
+3. **Train from the released checkpoint and evaluate.** `/data/all` holds the original and the new recordings and annotation tables (`audio/` and `*aplose*.csv`).
+
+   ```bash
+   ADD_CLASSES_FROM=checkpoints/best_model.pth SPLIT_DIR=/data/combined_split \
+       TRAINING_DATA_DIR=/data/all OUTPUT_DIR=/data/somad_out ./run_v19_pipeline.sh train
+   SPLIT_DIR=/data/combined_split TRAINING_DATA_DIR=/data/all OUTPUT_DIR=/data/somad_out \
+       ./run_v19_pipeline.sh eval
+   ```
+
+   The evaluation stage writes calibrated thresholds for all classes, which are then used with `run_inference.py`.
+
+**If only the new data are available.** Of the original training data, only the BlueFinLibrary (Miller et al., 2021) is public. Training on the new data alone with the same commands teaches the new class. But the old classes then get little or no training signal while the shared layers change, so their v19 validation results and thresholds no longer apply. Adding the public BlueFinLibrary back keeps the baleen whale classes trained.
 
 ## Reproducing the BlueFinLibrary benchmark (Schall et al., 2024)
 
