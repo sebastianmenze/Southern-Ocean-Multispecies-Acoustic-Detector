@@ -176,7 +176,7 @@ print(events["predicted_label"].value_counts())
    Frequency bounds are not needed: SOMAD labels 0.5 s time bins per class. The start time of each audio file is read from its name, which must contain it as `YYYY_MM_DD_HH_MM_SS`.
 
 2. **Configure classes and sources in `class_config.json`** (next to the scripts). The released file holds the full 11-class configuration used in the paper; add new classes and sources to it.
-   - **Classes.** Each class maps one model output to one or more annotation labels. `band` (`"lf"` or `"hf"`) is required by the file format but does not affect the single VQT model.
+   - **Classes.** Each class maps one model output to one or more annotation labels. The model's outputs follow the order of `classes`; append new classes at the end.
    - **Uncertain labels.** Labels listed under `uncertain_labels` mask that class for the annotated time instead of counting as a positive.
    - **Sources.** `stem_source_rules` assigns files to a data source by a substring of their name. Each entry in `sources` (glob patterns allowed) sets which classes that source was annotated for in `annotated_classes`. Every other class is masked for its files, so its unannotated calls do not count as negatives. `split` is one of `random`, `train_only`, `val_only` or `ignore`. `sample_weight` scales how often the source's windows are drawn.
 
@@ -185,8 +185,8 @@ print(events["predicted_label"].value_counts())
    ```json
    {
      "classes": [
-       {"name": "Leopard seal", "band": "hf", "aplose_labels": ["Leopard seal"]},
-       {"name": "Bearded seal", "band": "hf", "aplose_labels": ["Bearded seal", "Erignathus trill"]}
+       {"name": "Leopard seal", "aplose_labels": ["Leopard seal"]},
+       {"name": "Bearded seal", "aplose_labels": ["Bearded seal", "Erignathus trill"]}
      ],
      "uncertain_labels": {"Bearded seal (uncertain)": "Bearded seal"},
      "stem_source_rules": [{"contains": "_ARCTIC01_", "source": "arctic01"}],

@@ -12,8 +12,7 @@ and SimSiam tower pretraining (use the v13 code for those). The spectrogram is
 computed inside the model (CQTFrontend) on the GPU; the DataLoader only
 decodes audio and applies waveform augmentation. See CHANGES_v17.md.
 
-Classes keep v13's two blocks (class_config.json "band": lf / hf) only as an
-ordering convention: LF classes first, then HF classes, all scored jointly.
+All classes are scored jointly, in the order they are listed in class_config.json.
 Perch's "Background" class is deliberately not reproduced: "no class active"
 is the implicit negative of these multi-label sequence taggers.
 """
@@ -126,29 +125,13 @@ class _TimingStats:
 # Canonical label sets (must match perch_training/label_map*.json naming)
 # --------------------------------------------------------------------------
 
-LF_LABELS = [
-    "Fin whale 20 Hz",
-    "Fin whale downsweep",
-    "Blue whale AB call",      # v5: A call + B call combined -- see APLOSE_LABEL_MAP's comment
-    "Blue whale D call",
-    "Blue whale Z call",       # v5: new, bluefin_library-only
-    "Minke whale",             # v5: new, bluefin_library-only (bioduck + downsweep/other minke calls combined)
-]
+# All classes in the model's output order = the order of "classes" in class_config.json.
+# Filled (in place) by configure_classes() below, at import.
+LABELS = []
 
-HF_LABELS = [
-    "Humpback",
-    "Leopard seal",
-    "Weddell seal",
-    "Crabeater seal",
-    "Orca",
-]
-
-# All classes, LF block first -- the model's output order.
-JOINT_LABELS = LF_LABELS + HF_LABELS
-
-# One band, "cqt", scoring every class (same list object as JOINT_LABELS, so
-# configure_classes' in-place update reaches it too).
-BAND_LABELS = {"cqt": JOINT_LABELS}
+# One band, "cqt", scoring every class (same list object as LABELS, so configure_classes' in-place
+# update reaches it too).
+BAND_LABELS = {"cqt": LABELS}
 
 # --------------------------------------------------------------------------
 # Raw annotation label -> canonical label maps, one per source dataset.
@@ -225,7 +208,7 @@ SOI_LABEL_MAP = {
 # class_config.json (see class_config.py). The literal lists/maps above are
 # only the v12 defaults the config is mutated INTO, in place -- every
 # existing reference (BAND_LABELS, the dataset, scripts that import
-# common.JOINT_LABELS...) keeps pointing at the same list/dict objects.
+# common.LABELS...) keeps pointing at the same list/dict objects.
 # Adding a class later = edit class_config.json, no code change here.
 # --------------------------------------------------------------------------
 import class_config as _class_config
@@ -235,15 +218,13 @@ CLASS_CFG = None
 
 
 def configure_classes(path_or_dict=None):
-    """(Re)load the class/source config and update LF/HF/JOINT_LABELS and the
+    """(Re)load the class/source config and update LABELS and the
     label maps in place. Called once at import with the shipped
     class_config.json (or $SOMAD_CLASS_CONFIG); call again with a path/dict
     to switch (somad_args.resolve_defaults does, for --class-config)."""
     global CLASS_CFG
     cfg = _class_config.load_class_config(path_or_dict)
-    LF_LABELS[:] = cfg.lf_labels
-    HF_LABELS[:] = cfg.hf_labels
-    JOINT_LABELS[:] = LF_LABELS + HF_LABELS
+    LABELS[:] = cfg.labels
     APLOSE_LABEL_MAP.clear()
     APLOSE_LABEL_MAP.update(cfg.aplose_map)
     SOI_LABEL_MAP.clear()
@@ -593,7 +574,7 @@ def drop_out_of_scope_annotations(df_anno: pd.DataFrame, audio_index: dict) -> p
     if df_anno is None or df_anno.empty or "label" not in df_anno.columns:
         return df_anno
     df_anno = add_pooled_class_rows(df_anno)
-    labels = list(JOINT_LABELS)
+    labels = list(LABELS)
     li = {lb: i for i, lb in enumerate(labels)}
     scope = stem_scope_matrix(df_anno["stem"].unique(), audio_index, labels)
     keep = [
@@ -2452,7 +2433,7 @@ def run_training(band: str, args):
     # classes were added. Only the classifier's last Linear layer's output
     # dimension actually depends on num_classes; its rows are copied over
     # by NAME (not position), since a new class inserted in the MIDDLE of
-    # JOINT_LABELS (e.g. added to LF_LABELS) shifts every later class's
+    # LABELS (i.e. not appended at the end of class_config.json) shifts every later class's
     # index -- position-based copying would silently scramble which row
     # means which class. New classes' rows are left at the classifier's
     # own fresh random init (nothing to warm-start them from).

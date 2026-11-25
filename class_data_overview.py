@@ -63,7 +63,6 @@ def main():
                     help="ignore audio folders; build the file list from the annotation CSVs only")
     args = resolve_defaults(p.parse_args())
     L = list(common.BAND_LABELS["cqt"])
-    band = {c["name"]: c["band"] for c in common.CLASS_CFG.classes}
 
     audio_dirs = common.resolve_audio_dirs(args, "cqt")
     have_audio = (not args.annotations_only) and any(
@@ -95,7 +94,7 @@ def main():
         vsrc = sorted(t.loc[(t["split"] == "val") & (t["positive_bins"] > 0), "source"].unique())
         masked_in = sorted({s for s in set(src.values())
                             if not common.CLASS_CFG.scope(s, [lb])[0]})
-        tot_rows.append({"class": lb, "band": band[lb], "train_bins": tr, "val_bins": va, "total_bins": tr + va,
+        tot_rows.append({"class": lb, "train_bins": tr, "val_bins": va, "total_bins": tr + va,
                          "val_%": round(100 * va / max(1, tr + va), 1),
                          "train_sources": ", ".join(tsrc), "val_sources": ", ".join(vsrc),
                          "masked_in_sources": ", ".join(masked_in),
@@ -141,7 +140,7 @@ def main():
               "draw are approximate; bin counts per source are exact.*" if approx else
               "*Computed on the audio folders found, un-annotated files included.*"),
              "", "## 1. Per class", "",
-             md(totals[["class", "band", "train_bins", "val_bins", "total_bins", "val_%", "train_sources",
+             md(totals[["class", "train_bins", "val_bins", "total_bins", "val_%", "train_sources",
                         "val_sources", "scored_in_selection"]]),
              "", "## 2. Per source", "",
              md(srcs),

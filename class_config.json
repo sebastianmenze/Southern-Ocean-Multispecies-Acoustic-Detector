@@ -3,7 +3,6 @@
  "classes": [
   {
    "name": "Fin whale 20 Hz",
-   "band": "lf",
    "aplose_labels": [
     "Fin whale 20 Hz"
    ],
@@ -13,7 +12,6 @@
   },
   {
    "name": "Fin whale downsweep",
-   "band": "lf",
    "aplose_labels": [
     "Fin whale downsweep"
    ],
@@ -23,7 +21,6 @@
   },
   {
    "name": "Blue whale AB call",
-   "band": "lf",
    "aplose_labels": [
     "Blue whale A",
     "Blue whale B",
@@ -36,7 +33,6 @@
   },
   {
    "name": "Blue whale D call",
-   "band": "lf",
    "aplose_labels": [
     "Blue whale D",
     "Blue whale D call"
@@ -47,7 +43,6 @@
   },
   {
    "name": "Blue whale Z call",
-   "band": "lf",
    "aplose_labels": [
     "Blue whale Z call"
    ],
@@ -57,7 +52,6 @@
   },
   {
    "name": "Blue whale ABZ call",
-   "band": "lf",
    "aplose_labels": [],
    "soi_labels": [],
    "pooled_from": [
@@ -67,7 +61,6 @@
   },
   {
    "name": "Minke whale",
-   "band": "lf",
    "aplose_labels": [
     "Minke whale"
    ],
@@ -75,7 +68,6 @@
   },
   {
    "name": "Southern right whale",
-   "band": "lf",
    "aplose_labels": [
     "Southern right whale",
     "SRW"
@@ -89,7 +81,6 @@
   },
   {
    "name": "Humpback",
-   "band": "hf",
    "aplose_labels": [
     "Humpback",
     "Humpback squeaking",
@@ -107,7 +98,6 @@
   },
   {
    "name": "Leopard seal",
-   "band": "hf",
    "aplose_labels": [
     "Leopard seal"
    ],
@@ -117,7 +107,6 @@
   },
   {
    "name": "Weddell seal",
-   "band": "hf",
    "aplose_labels": [
     "Weddell seal"
    ],
@@ -127,7 +116,6 @@
   },
   {
    "name": "Crabeater seal",
-   "band": "hf",
    "aplose_labels": [
     "Crabeater seal"
    ],
@@ -137,7 +125,6 @@
   },
   {
    "name": "Orca",
-   "band": "hf",
    "aplose_labels": [
     "Orca"
    ],

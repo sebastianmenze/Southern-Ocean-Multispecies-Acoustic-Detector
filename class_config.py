@@ -19,7 +19,6 @@ import json
 import os
 
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "class_config.json")
-_VALID_BANDS = ("lf", "hf")
 _VALID_SPLITS = ("random", "train_only", "val_only", "ignore")
 
 
@@ -34,9 +33,6 @@ class ClassConfig:
         if len(set(names)) != len(names):
             dup = sorted({n for n in names if names.count(n) > 1})
             raise ValueError(f"{origin}: duplicate class names {dup}")
-        for c in classes:
-            if c.get("band") not in _VALID_BANDS:
-                raise ValueError(f"{origin}: class {c['name']!r} needs band in {_VALID_BANDS}, got {c.get('band')!r}")
         self.classes = classes
         # v18: "pooled_from": a class whose positives are the union of other classes' annotations
         # (e.g. Blue whale ABZ = AB + Z). Annotation rows of the member classes are duplicated
@@ -49,9 +45,9 @@ class ClassConfig:
                 if bad:
                     raise ValueError(f"{origin}: class {c['name']!r} pooled_from has unknown/self classes {bad}")
                 self.pooled[c["name"]] = list(c["pooled_from"])
-        self.lf_labels = [c["name"] for c in classes if c["band"] == "lf"]
-        self.hf_labels = [c["name"] for c in classes if c["band"] == "hf"]
-        self.joint_labels = self.lf_labels + self.hf_labels
+        # the model's output order = the order of "classes" in the config (a legacy "band": lf/hf entry is
+        # ignored; v13-v18 configs listed all lf classes before all hf classes, so their order is unchanged)
+        self.labels = list(names)
 
         self.aplose_map, self.soi_map = {}, {}
         for c in classes:

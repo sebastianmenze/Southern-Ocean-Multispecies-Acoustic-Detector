@@ -95,7 +95,7 @@ def build_argparser():
                          "one. See --resume-add-classes if you specifically want to add classes.")
     p.add_argument("--resume-add-classes", default=None,
                     help="v12: path to an OLDER checkpoint trained on a SUBSET of this run's current "
-                         "label list (e.g. you added a new class to JOINT_LABELS/LF_LABELS/HF_LABELS and "
+                         "label list (e.g. you added a new class to class_config.json and "
                          "have new annotations for it) -- warm-starts a NEW training phase from it: the "
                          "CNN towers/BiGRU/attention load unchanged (none of those depend on num_classes), "
                          "the classifier's final layer is rebuilt at the new, larger size with old classes' "

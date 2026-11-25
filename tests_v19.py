@@ -63,8 +63,8 @@ V13_LABELS = V12_LABELS[:6] + [SRW] + V12_LABELS[6:]      # new LF class appende
 
 @check("config: v12's 11 classes keep their order, + Southern right whale at the end of the LF block")
 def _():
-    assert common.JOINT_LABELS == V13_LABELS, common.JOINT_LABELS
-    assert common.BAND_LABELS["cqt"] is common.JOINT_LABELS
+    assert common.LABELS == V13_LABELS, common.LABELS
+    assert common.BAND_LABELS["cqt"] is common.LABELS
     for raw, cls in {"Humpback song": "Humpback", "Blue whale B": "Blue whale AB call", "Orca": "Orca",
                      "Blue whale D call": "Blue whale D call", "Minke whale": "Minke whale"}.items():
         assert common.APLOSE_LABEL_MAP[raw] == cls
@@ -76,7 +76,7 @@ def _():
 
 @check("scope: DCLDE sources only annotated for Orca/Humpback (VFPA: Orca only); old sources all classes")
 def _():
-    cfg, L = common.CLASS_CFG, common.JOINT_LABELS
+    cfg, L = common.CLASS_CFG, common.LABELS
     assert cfg.source_of("2022_03_08_17_49_41_DFOWDLP_ST6249_x") == "dclde_wdlp"
     assert cfg.source_of("2017_07_18_04_30_01_VFPAONC_x") == "dclde_vfpa"
     sc = dict(zip(L, cfg.scope("dclde_wdlp", L)))
@@ -92,7 +92,7 @@ def _():
 
 @check("bluefin: D call + downsweep only from Elephant Island; Kerguelen used for its other classes; the rest ignored")
 def _():
-    cfg, L = common.CLASS_CFG, common.JOINT_LABELS
+    cfg, L = common.CLASS_CFG, common.LABELS
     D, DS, MK = "Blue whale D call", "Fin whale downsweep", "Minke whale"
     def ann(src): return {k for k, v in zip(L, cfg.scope(src, L)) if v}
     lf6 = set(V12_LABELS[:6])
@@ -227,11 +227,11 @@ def _():
     saved = copy.deepcopy(common.CLASS_CFG.raw)
     try:
         d = copy.deepcopy(saved)
-        d["classes"].append({"name": "Sperm whale", "band": "hf", "aplose_labels": ["Sperm whale"],
+        d["classes"].append({"name": "Sperm whale", "aplose_labels": ["Sperm whale"],
                              "soi_labels": [], "annotated_in": ["spermnet*"]})
         common.configure_classes(d)
-        L = common.JOINT_LABELS
-        assert len(L) == 13 and L.index("Sperm whale") == len(L) - 1          # appended to the HF block
+        L = common.LABELS
+        assert len(L) == 13 and L.index("Sperm whale") == len(L) - 1          # appended at the end, in config order
         assert common.APLOSE_LABEL_MAP["Sperm whale"] == "Sperm whale"
         cfg = common.CLASS_CFG
         sc_old = dict(zip(L, cfg.scope("hermine_SN8059_aplose_subset_2h", L)))
@@ -242,14 +242,14 @@ def _():
         # old class order unchanged -> warm-start by name has nothing to scramble
         assert L[:12] == V13_LABELS
         # a bad config is rejected loudly
-        bad = copy.deepcopy(d); bad["classes"].append({"name": "Orca", "band": "hf"})
+        bad = copy.deepcopy(d); bad["classes"].append({"name": "Orca"})
         try:
             class_config.load_class_config(bad); raise AssertionError("duplicate class accepted")
         except ValueError:
             pass
     finally:
         common.configure_classes(saved)
-    assert len(common.JOINT_LABELS) == 12
+    assert len(common.LABELS) == 12
 
 
 def _write_wav(path, seconds=130, sr=32000, seed=0):
@@ -316,7 +316,7 @@ def _():
         df, idx = common.build_dataset_table(args.aplose_csv, args.soi_csv, common.resolve_audio_dirs(args, "cqt"))
         assert set(ds) <= set(idx) and set(hs) <= set(idx) and set(ss) <= set(idx)
         assert df["mask_label"].notna().sum() == 3 and (df["label"] == "Orca").sum() >= 5
-        L = common.JOINT_LABELS
+        L = common.LABELS
         ds_ = common.PamSequenceDataset([ds[0]], idx, df, band="cqt", augment=False, return_mask=True)
         spec, labels, mask = ds_[0]
         assert mask.shape == labels.shape == (12, 121)
@@ -346,7 +346,7 @@ def _():
         hs, ss, ds = _build_tiny_dataset(root)
         args = train_lf.resolve_defaults(train_lf.build_argparser().parse_args(["--data-root", root]))
         df, idx = common.build_dataset_table(args.aplose_csv, args.soi_csv, common.resolve_audio_dirs(args, "cqt"))
-        L = common.JOINT_LABELS
+        L = common.LABELS
         w_h = common.compute_class_weights(df, hs, idx, L, 60.0).numpy()
         w_hd = common.compute_class_weights(df, hs + ds, idx, L, 60.0).numpy()
         i = L.index("Leopard seal")
@@ -507,7 +507,7 @@ def _():
             x, labels, mask = ds[i]
             w = x["wave"][0]
             assert w.shape == (n_total,) and int(x["aug"]) == 0
-            assert labels.shape == mask.shape == (len(common.JOINT_LABELS), 121)
+            assert labels.shape == mask.shape == (len(common.LABELS), 121)
             assert int(torch.argmax(w.abs())) == int(round((pad + 40.0 - start) * SR)), (start, int(torch.argmax(w.abs())))
         w0 = ds[0][0]["wave"][0]
         assert w0[: int(pad * SR)].abs().max() == 0, "left pad before the file start must be zeros"
@@ -520,12 +520,12 @@ def _():
 @check("model: single CQT tower; dict batch -> (B, C, 121) logits; frontend buffers not in the state_dict")
 def _():
     small = {**CFG, "hidden_size": 32, "gru_layers": 1, "pooled_freq_rows": 8}
-    m = common.build_model(small, len(common.JOINT_LABELS), use_attention=True).eval()
+    m = common.build_model(small, len(common.LABELS), use_attention=True).eval()
     n = m.frontend.block
     x = {"wave": torch.randn(2, 1, n) * 0.01, "aug": torch.zeros(2, dtype=torch.int64)}
     with torch.no_grad():
         y = m(x)
-    assert y.shape == (2, len(common.JOINT_LABELS), 121), y.shape
+    assert y.shape == (2, len(common.LABELS), 121), y.shape
     assert not any(k.startswith("frontend.") for k in m.state_dict()), "CQT kernels leaked into the checkpoint"
     assert not any(k.startswith(("cnn_hf", "cnn_lf")) for k in m.state_dict()) and hasattr(m, "cnn")
     assert m.cnn[0].in_channels == 1
@@ -535,7 +535,7 @@ def _():
 
 @check("v19 config: downsweep masked for bluefin_kerguelen2015; Humpback masked for all BlueFin; ABZ kept")
 def _():
-    L = common.JOINT_LABELS
+    L = common.LABELS
     k15 = common.CLASS_CFG.scope("bluefin_kerguelen2015", L)
     k14 = common.CLASS_CFG.scope("bluefin_kerguelen2014", L)
     ds = L.index("Fin whale downsweep")
@@ -633,7 +633,7 @@ def _():
 @check("v19 masked eval: continuous inference carries the masks; thresholds/AP/events ignore masked bins")
 def _():
     import predict_eval
-    L = common.JOINT_LABELS
+    L = common.LABELS
     with tempfile.TemporaryDirectory() as root:
         stem = "2005_02_20_15_45_00_kerguelen2015_x_s01"   # bluefin_kerguelen2015: downsweep out of scope
         p = os.path.join(root, stem + ".wav")

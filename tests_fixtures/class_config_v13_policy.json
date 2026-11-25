@@ -2,18 +2,18 @@
   "_comment": "v13 class + data-source definition. Edit this file (not common.py) to add a class or a data source. See CHANGES_v13.md section 'Adding a class later'.",
 
   "classes": [
-    {"name": "Fin whale 20 Hz",     "band": "lf", "aplose_labels": ["Fin whale 20 Hz"],                       "soi_labels": ["fw_20hz"]},
-    {"name": "Fin whale downsweep", "band": "lf", "aplose_labels": ["Fin whale downsweep"],                   "soi_labels": ["fw_downsweep"]},
-    {"name": "Blue whale AB call",  "band": "lf", "aplose_labels": ["Blue whale A", "Blue whale B", "Blue whale A call", "Blue whale B call"], "soi_labels": ["bw_a"]},
-    {"name": "Blue whale D call",   "band": "lf", "aplose_labels": ["Blue whale D", "Blue whale D call"],     "soi_labels": ["bw_dcall"]},
-    {"name": "Blue whale Z call",   "band": "lf", "aplose_labels": ["Blue whale Z call"],                     "soi_labels": ["bw_zcall"]},
-    {"name": "Minke whale",         "band": "lf", "aplose_labels": ["Minke whale"],                           "soi_labels": []},
-    {"name": "Southern right whale", "band": "lf", "aplose_labels": ["Southern right whale", "SRW"],       "soi_labels": [], "annotated_in": ["srw_*", "hermine*", "*soi*"]},
-    {"name": "Humpback",            "band": "hf", "aplose_labels": ["Humpback", "Humpback squeaking", "Humbpack groaning", "Humpback song", "Humpback LF tonal", "Humpback impulse", "Humpback bursts"], "soi_labels": ["humpback", "humpbacks", "humpack?"]},
-    {"name": "Leopard seal",        "band": "hf", "aplose_labels": ["Leopard seal"],                          "soi_labels": ["leopard_seal"]},
-    {"name": "Weddell seal",        "band": "hf", "aplose_labels": ["Weddell seal"],                          "soi_labels": ["weddell_seal"]},
-    {"name": "Crabeater seal",      "band": "hf", "aplose_labels": ["Crabeater seal"],                        "soi_labels": ["crabeater_seal"]},
-    {"name": "Orca",                "band": "hf", "aplose_labels": ["Orca"],                                  "soi_labels": ["orca", "orca?", "orcas?"]}
+    {"name": "Fin whale 20 Hz", "aplose_labels": ["Fin whale 20 Hz"],                       "soi_labels": ["fw_20hz"]},
+    {"name": "Fin whale downsweep", "aplose_labels": ["Fin whale downsweep"],                   "soi_labels": ["fw_downsweep"]},
+    {"name": "Blue whale AB call", "aplose_labels": ["Blue whale A", "Blue whale B", "Blue whale A call", "Blue whale B call"], "soi_labels": ["bw_a"]},
+    {"name": "Blue whale D call", "aplose_labels": ["Blue whale D", "Blue whale D call"],     "soi_labels": ["bw_dcall"]},
+    {"name": "Blue whale Z call", "aplose_labels": ["Blue whale Z call"],                     "soi_labels": ["bw_zcall"]},
+    {"name": "Minke whale", "aplose_labels": ["Minke whale"],                           "soi_labels": []},
+    {"name": "Southern right whale", "aplose_labels": ["Southern right whale", "SRW"],       "soi_labels": [], "annotated_in": ["srw_*", "hermine*", "*soi*"]},
+    {"name": "Humpback", "aplose_labels": ["Humpback", "Humpback squeaking", "Humbpack groaning", "Humpback song", "Humpback LF tonal", "Humpback impulse", "Humpback bursts"], "soi_labels": ["humpback", "humpbacks", "humpack?"]},
+    {"name": "Leopard seal", "aplose_labels": ["Leopard seal"],                          "soi_labels": ["leopard_seal"]},
+    {"name": "Weddell seal", "aplose_labels": ["Weddell seal"],                          "soi_labels": ["weddell_seal"]},
+    {"name": "Crabeater seal", "aplose_labels": ["Crabeater seal"],                        "soi_labels": ["crabeater_seal"]},
+    {"name": "Orca", "aplose_labels": ["Orca"],                                  "soi_labels": ["orca", "orca?", "orcas?"]}
   ],
 
   "_uncertain_comment": "Raw labels that mark 'a call of this class may be here, not sure': NOT a positive and NOT a negative -- those bins are masked out of the loss for that class.",
