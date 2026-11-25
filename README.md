@@ -45,7 +45,7 @@ somad_v19/
 │   schall_benchmark_partial.py, fix_kerguelen2015_downsweep.py   helpers for the pipeline and manuscript analyses
 ├── tests_v19.py              self-tests on synthetic data (CPU)
 ├── checkpoints/
-│   ├── best_model.pth                    trained v19 weights (download, see below)
+│   ├── best_model.pth                    trained v19 weights (download from Zenodo, see below)
 │   └── thresholds_cqt_continuous.csv     calibrated per-class decision thresholds
 ├── Dockerfile, requirements.txt, setup_env.sh
 └── LICENSE (MIT)
@@ -58,8 +58,8 @@ SOMAD is written in Python (3.9–3.13) and uses PyTorch (≥ 2.4.1). Pick one o
 **Option 1: virtual environment.** `setup_env.sh` finds a suitable Python and detects the GPU, including older Pascal cards (those get a CUDA 11.8 build). It then installs PyTorch and `requirements.txt` into `.venv`.
 
 ```bash
-git clone <repository URL> somad_v19
-cd somad_v19
+git clone https://github.com/sebastianmenze/Southern-Ocean-Multispecies-Acoustic-Detector.git somad
+cd somad
 ./setup_env.sh                 # add --cpu to force a CPU-only PyTorch build
 source .venv/bin/activate
 python tests_v19.py            # self-tests on synthetic data, ~1–2 min on CPU
@@ -74,7 +74,13 @@ docker build -t somad .
 docker run --gpus all --rm -v /data:/data somad run_inference.py --help
 ```
 
-**Trained checkpoint.** Download `best_model.pth` (archived separately, DOI to be added) into `checkpoints/`. The calibrated thresholds file `checkpoints/thresholds_cqt_continuous.csv` is already in the repository.
+**Trained checkpoint.** The v19 weights (`best_model.pth`, about 1.1 GB) are archived on Zenodo, [doi:10.5281/zenodo.24530417](https://doi.org/10.5281/zenodo.24530417), and not stored in git. Download them once after cloning:
+
+```bash
+curl -L -o checkpoints/best_model.pth https://zenodo.org/records/24530417/files/best_model.pth
+```
+
+The calibrated thresholds file `checkpoints/thresholds_cqt_continuous.csv` is already in the repository.
 
 ## Worked example: detecting calls in a new deployment
 
