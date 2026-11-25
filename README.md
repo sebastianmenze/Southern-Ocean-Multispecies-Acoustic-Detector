@@ -1,4 +1,9 @@
-# SOMAD v19: Southern Ocean Multispecies Acoustic Detector
+<p align="center">
+  <img src="somad_logo.png" alt="SOMAD logo" width="260"/>
+</p>
+
+<h1 align="center">SOMAD v19</h1>
+<p align="center"><b>Southern Ocean Multispecies Acoustic Detector</b></p>
 
 SOMAD detects 11 co-occurring Southern Ocean marine mammal call types in **one forward pass over a 60 s, 7.8 Hz–16 kHz acoustic scene**. It scores every class every 0.5 s.
 
