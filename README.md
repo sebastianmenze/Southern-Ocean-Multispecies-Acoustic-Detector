@@ -191,30 +191,31 @@ print(events["predicted_label"].value_counts())
 
 ## Adding classes to the released v19 model
 
-New classes are added by continuing training from the released checkpoint (`ADD_CLASSES_FROM`). Every layer is copied from it, and the final layer's outputs are copied by class name. The new class's output starts from random weights. The new recordings and their annotation table are prepared as in step 1 above. For example, to add bearded seal recorded at a new site whose file names contain `_ARCTIC01_`:
+New classes are added by continuing training from the released checkpoint (`ADD_CLASSES_FROM`). Every layer is copied from it, and the final layer's outputs are copied by class name. The new class's output starts from random weights. The new recordings and their annotation table are prepared as in step 1 above. For example, to add Ross seal from a new data set whose file names contain `_ROSS01_`:
 
 1. **Append the new class and source to the released `class_config.json`.** Don't start a new file. All classes of the checkpoint (the 11 reported ones plus the separate "Blue whale AB call" and "Blue whale Z call" outputs) must stay in it, in the same order, because the model's outputs follow that order.
 
    ```
    "classes": [ ...the 13 released classes...,
-       {"name": "Bearded seal", "aplose_labels": ["Bearded seal"]} ],
-   "uncertain_labels": { ..., "Bearded seal (uncertain)": "Bearded seal" },
-   "stem_source_rules": [ ..., {"contains": "_ARCTIC01_", "source": "arctic01"} ],
+       {"name": "Ross seal", "aplose_labels": ["Ross seal"]} ],
+   "uncertain_labels": { ..., "Ross seal (uncertain)": "Ross seal" },
+   "stem_source_rules": [ ..., {"contains": "_ROSS01_", "source": "ross01"} ],
    "sources": { ...,
-       "arctic01": {"annotated_classes": ["Bearded seal", "Leopard seal", "Weddell seal",
-                                          "Crabeater seal"], "split": "random"} }
+       "*soi*": {"annotated_classes": [ ...the 13 released classes... ], "split": "random"},
+       "ross01": {"annotated_classes": ["Ross seal", "Leopard seal", "Weddell seal",
+                                        "Crabeater seal"], "split": "random"} }
    ```
 
-   - **The new source.** In `annotated_classes`, include every existing class the annotators also checked, or that cannot occur in the region (here the Antarctic seals). The old outputs keep learning only from such negatives.
-   - **The original sources** keep their original class lists, so the new class is masked there. A source declared with `"all"` (in the released file only `*soi*`, the South Orkney recordings) then also covers the new class, so its unannotated audio counts as negatives. That is correct when the new class cannot occur there, as for bearded seals in the Southern Ocean. Otherwise replace `"all"` by the explicit list of the original classes.
+   - **The new source.** In `annotated_classes`, include every existing class the annotators also checked (here the other three seal classes). The old outputs keep learning only from such negatives.
+   - **The original sources** keep their original class lists, so the new class is masked there. A source declared with `"all"` (in the released file only `*soi*`, the South Orkney recordings) would also cover the new class, so its unannotated audio would count as negatives. Ross seals can occur there, so `"all"` is replaced by the explicit list of the 13 original classes, as in the example. Keep `"all"` only where the new class cannot occur.
 
 2. **Split only the new files and keep the released split.** `split/train_files.txt` and `split/val_files.txt` list the files of SOMAD's original training set. Keeping them ensures that no file used to validate v19 enters training. Files listed in neither list are not used.
 
    ```bash
-   TRAINING_DATA_DIR=/data/arctic01 OUTPUT_DIR=/data/arctic01_out ./run_v19_pipeline.sh split
+   TRAINING_DATA_DIR=/data/ross01 OUTPUT_DIR=/data/ross01_out ./run_v19_pipeline.sh split
    mkdir -p /data/combined_split
-   cat split/train_files.txt /data/arctic01_out/split/train_files.txt > /data/combined_split/train_files.txt
-   cat split/val_files.txt /data/arctic01_out/split/val_files.txt > /data/combined_split/val_files.txt
+   cat split/train_files.txt /data/ross01_out/split/train_files.txt > /data/combined_split/train_files.txt
+   cat split/val_files.txt /data/ross01_out/split/val_files.txt > /data/combined_split/val_files.txt
    ```
 
 3. **Train from the released checkpoint and evaluate.** `/data/all` holds the original and the new recordings and annotation tables (`audio/` and `*aplose*.csv`).
