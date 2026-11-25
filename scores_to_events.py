@@ -1,3 +1,4 @@
+# AI-assisted code: developed with Claude Code (Anthropic); reviewed and tested by the SOMAD authors.
 """
 Convert run_inference.py's combined netCDF (raw per-bin scores +
 thresholds + above_threshold) into an event CSV (source_file, band,

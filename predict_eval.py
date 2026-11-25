@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Evaluate a trained checkpoint (LF, HF, or joint) on its validation
-split: runs inference over the val set, finds the best-F1 decision
-threshold per class from a precision/recall curve, and saves plots + a
-thresholds CSV.
+# AI-assisted code: developed with Claude Code (Anthropic); reviewed and tested by the SOMAD authors.
+"""Evaluate a trained LF or HF BiGRU checkpoint on its validation split:
+runs inference over the val set, finds the best-F1 decision threshold per
+class from a precision/recall curve, and saves plots + a thresholds CSV.
 
-Thresholds are calibrated two ways and both are reported -- see the
-"window" vs "continuous" note in main() for why; always use the
-*continuous* one downstream (that's what `checkpoints/
-thresholds_joint_continuous.csv` and `run_inference.py` expect).
+v3: calibrates thresholds TWO ways and reports both, rather than silently
+picking one -- see the "window" vs "continuous" note in main() for why.
 
-Usage:
+Usage (nautilus, v2 output tree -- see README.md):
 
-    python predict_eval.py --band joint --checkpoint checkpoints/best_model.pth
+    python predict_eval.py --checkpoint /data/somad/output_v5/bigru_lf/best_model.pth
+    python predict_eval.py --checkpoint /data/somad/output_v5/bigru_hf/best_model.pth \
+        --output-dir /data/somad/output_v5/eval_hf
 
-If running this inside Docker, pass `--shm-size=16g` (or larger) to
-`docker run` -- the default container shared-memory size is too small for
-the DataLoader workers and fails with a misleading "No space left on
-device".
+Prefer `./run_nautilus_eval.sh {lf|hf}` over calling this directly --
+it sets `--shm-size=16g`, which this needs when run in Docker (the default
+container shm is too small for the DataLoader workers and fails with a
+misleading "No space left on device").
 """
 
 import argparse
@@ -33,20 +33,38 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import common
-from train_lf import build_argparser, resolve_defaults
+import eval_scores
+from somad_args import build_argparser, resolve_defaults
 
 
-def fit_thresholds(y_true_2d: np.ndarray, y_pred_2d: np.ndarray, label_list, curve_points: int = 500):
+def fit_thresholds(y_true_2d: np.ndarray, y_pred_2d: np.ndarray, label_list, curve_points: int = 500,
+                   mask_2d: np.ndarray = None):
     """Per-class best-F1 threshold + average precision from a PR curve,
     given pooled (n_samples, n_classes) arrays. Returns (thresholds_best,
     f1_best, avg_precision, curve_df) -- curve_df has the full
     precision/recall/fscore-vs-threshold sweep per class, for
-    plotting/saving."""
+    plotting/saving.
+
+    v19: `mask_2d` (same shape, 1 = scored) restricts each class to its
+    scored bins -- out-of-scope sources and "uncertain" annotations are
+    neither positives nor negatives, exactly as in training/selection. A class
+    with no scored positives gets NaN threshold/F1/AP."""
     thresholds_best, f1_best, avg_precision = [], [], []
     curve_df = pd.DataFrame([])
     for i_class, lb in enumerate(label_list):
         y_true = y_true_2d[:, i_class]
         y_pred = y_pred_2d[:, i_class]
+        if mask_2d is not None:
+            keep = mask_2d[:, i_class] > 0
+            y_true, y_pred = y_true[keep], y_pred[keep]
+        if y_true.sum() == 0 or len(np.unique(y_pred)) < 2:
+            nan = np.full(curve_points, np.nan)
+            for col in ("thresholds", "precision", "recall", "fscore"):
+                curve_df[f"{col}_{i_class}"] = nan
+            thresholds_best.append(np.nan)
+            f1_best.append(np.nan)
+            avg_precision.append(np.nan)
+            continue
 
         precision, recall, thresholds = precision_recall_curve(y_true, y_pred)
         # sklearn: precision[i]/recall[i] correspond to thresholds[i] for
@@ -81,6 +99,8 @@ def plot_pr_curves(curve_df, thresholds_best, f1_best, label_list, rare_classes,
         rec_i = curve_df[f"recall_{i_class}"]
         prec_i = curve_df[f"precision_{i_class}"]
         fscore = curve_df[f"fscore_{i_class}"]
+        if fscore.isna().all():
+            continue  # v19: no scored positives for this class
         ix = int(np.argmax(fscore))
         plt.plot(rec_i, prec_i, "-", label=lb + flag)
         plt.plot(rec_i[ix], prec_i[ix], ".k")
@@ -94,17 +114,23 @@ def plot_pr_curves(curve_df, thresholds_best, f1_best, label_list, rare_classes,
     plt.close()
 
 
-def per_file_frame_metrics(continuous: dict, label_list, thresholds) -> pd.DataFrame:
+def per_file_frame_metrics(continuous: dict, label_list, thresholds, use_mask: bool = False) -> pd.DataFrame:
     """Frame-level precision/recall/F1 broken down per validation file per
     class (not pooled across the whole val set), from the same continuous
     per-file timelines event scoring uses. Lets you tell "this class is
     just hard" apart from "this class's score is being dragged down by a
-    handful of unusual files"."""
+    handful of unusual files".
+
+    v19 use_mask: only scored bins count; a class outside a file's annotation
+    scope gets a row with scored_bins = 0 and NaN metrics."""
     rows = []
     for stem, d in continuous.items():
         for i_class, lb in enumerate(label_list):
             scores = d["scores"][i_class]
             true = d["true"][i_class]
+            if use_mask and "mask" in d:
+                keep = d["mask"][i_class] > 0
+                scores, true = scores[keep], true[keep]
             pred = (scores > thresholds[i_class]).astype(int)
             true_i = true.astype(int)
             tp = int(((pred == 1) & (true_i == 1)).sum())
@@ -123,15 +149,30 @@ def per_file_frame_metrics(continuous: dict, label_list, thresholds) -> pd.DataF
             else:
                 f1 = 2 * precision * recall / (precision + recall)
             rows.append(dict(stem=stem, label=lb, duration_s=round(d["duration"], 1),
-                              n_true_bins=int(true_i.sum()), tp=tp, fp=fp, fn=fn,
+                              scored_bins=int(len(true_i)), n_true_bins=int(true_i.sum()), tp=tp, fp=fp, fn=fn,
                               precision=precision, recall=recall, f1=f1))
     return pd.DataFrame(rows)
 
 
 def main():
     p = build_argparser()
-    p.add_argument("--band", choices=["lf", "hf", "joint"], required=True)
-    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--band", choices=["cqt"], default="cqt", help="v17 has one band, cqt (default)")
+    p.add_argument("--checkpoint", default=None,
+                    help="checkpoint to evaluate (not needed with --load-scores)")
+    p.add_argument("--save-scores", default=None,
+                    help="v19: where to save the scores of the single inference pass "
+                         "(default <output-dir>/scores_<band>.npz)")
+    p.add_argument("--load-scores", default=None,
+                    help="v19: recompute every output from a saved scores .npz instead of running the model "
+                         "(e.g. for --val-list subsets or --no-mask); no audio or GPU needed")
+    p.add_argument("--mask-config", default=None,
+                    help="v19: class_config.json whose annotation scopes / uncertain labels define the evaluation "
+                         "masks (default: the config stored in the checkpoint). Must have the same classes; e.g. "
+                         "the v19 config to score the v18 checkpoint with the Kerguelen 2015 downsweep mask.")
+    p.add_argument("--allow-skips", action="store_true",
+                    help="v19: continue even if more than 1%% of the validation files cannot be read")
+    p.add_argument("--val-list", default=None,
+                    help="v19: text file of file stems -- evaluate only these (a subset of the validation split)")
     p.add_argument("--no-overlap", action="store_true",
                     help="Cut windows back-to-back (snippet_overlap=1) instead of the default 50%% hop -- "
                          "e.g. non-overlapping 60s chunks for LF/HF, since snippet_length_s=60 for both. "
@@ -150,7 +191,14 @@ def main():
                          "'..._kerguelen2005_...', not containing 'bluefin' -- so they can't be filtered by "
                          "name alone); those are dropped from the val split too since they'd otherwise "
                          "KeyError against the now-restricted audio_index.")
+    p.add_argument("--no-mask", action="store_true",
+                    help="v19: score every bin of every validation file for every class, like v18 and "
+                         "earlier (masked classes/uncertain bins count as negatives). Default: masked "
+                         "evaluation, consistent with training and model selection.")
     args = resolve_defaults(p.parse_args())
+    use_mask = not args.no_mask
+    print("v19 evaluation:", "MASKED (out-of-scope classes and uncertain bins are not scored)" if use_mask
+          else "UNMASKED (--no-mask, v18 behaviour)")
 
     band = args.band
     if args.no_overlap:
@@ -162,83 +210,93 @@ def main():
         args.bluefin_dir = None
         print(f"--exclude-bluefin: aplose_csv restricted to {args.aplose_csv}, bluefin_dir dropped")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.output_dir, exist_ok=True)
+    keep_stems = eval_scores.read_list(args.val_list) if args.val_list else None
 
-    audio_dirs = common.resolve_audio_dirs(args, band)
-    df_anno, audio_index = common.build_dataset_table(args.aplose_csv, args.soi_csv, audio_dirs)
-
-    val_files_path = os.path.join(os.path.dirname(args.checkpoint), "val_files.txt")
-    if os.path.exists(val_files_path):
-        with open(val_files_path) as f:
-            val_stems = [l.strip() for l in f if l.strip()]
+    if args.load_scores:
+        continuous, windows, meta = eval_scores.load_scores(args.load_scores, keep_stems)
+        label_list, rare_classes, label_interval = meta["label_list"], set(meta["rare_classes"]), meta["label_interval"]
+        print(f"Loaded scores of {len(continuous)} files / {len(windows['stem'])} windows from {args.load_scores} "
+              f"(checkpoint {meta.get('checkpoint')}, epoch {meta.get('epoch')})")
     else:
-        _, val_stems = common.split_files(audio_index, val_fraction=args.val_fraction, seed=args.seed)
+        if not args.checkpoint:
+            raise SystemExit("ERROR: --checkpoint is required unless --load-scores is given")
+        audio_dirs = common.resolve_audio_dirs(args, band)
+        df_anno, audio_index = common.build_dataset_table(args.aplose_csv, args.soi_csv, audio_dirs)
 
-    if args.exclude_bluefin:
-        n_before = len(val_stems)
-        val_stems = [s for s in val_stems if s in audio_index]
-        print(f"--exclude-bluefin: dropped {n_before - len(val_stems)} bluefin val file(s) from the saved "
-              f"split, {len(val_stems)} real APLOSE/SOI val file(s) remain")
+        val_files_path = os.path.join(os.path.dirname(args.checkpoint), "val_files.txt")
+        if keep_stems is not None:
+            val_stems = keep_stems
+        elif os.path.exists(val_files_path):
+            val_stems = eval_scores.read_list(val_files_path)
+        else:
+            _, val_stems = common.get_split(args, audio_index, df_anno)
 
-    # Read architecture/label metadata back from the checkpoint rather than
-    # from today's common.py defaults, so eval always matches whatever the
-    # checkpoint was actually trained with (band_config, use_attention,
-    # label order, fusion_mode can all drift over time as the pipeline
-    # evolves). Loaded before val_set so the dataset is built with the
-    # SAME fusion_mode the checkpoint was trained on -- "channels"/
-    # "twotower" produce a differently-shaped input than the "stack"
-    # default, so getting this wrong crashes (or silently mismatches) the
-    # very first inference call.
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if checkpoint.get("band", band) != band:
-        print(f"WARNING: checkpoint was trained as band={checkpoint.get('band')!r}, "
-              f"but --band={band!r} was requested")
-    label_list = checkpoint.get("model_labels", common.BAND_LABELS[band])
-    band_config = checkpoint.get("band_config", common.BAND_CONFIG[band])
-    use_attention = checkpoint.get("use_attention", False)
-    fusion_mode = checkpoint.get("fusion_mode", "stack")
-    rare_classes = set(checkpoint.get("rare_classes", []))
+        if args.exclude_bluefin:
+            n_before = len(val_stems)
+            val_stems = [s for s in val_stems if s in audio_index]
+            print(f"--exclude-bluefin: dropped {n_before - len(val_stems)} bluefin val file(s) from the saved "
+                  f"split, {len(val_stems)} real APLOSE/SOI val file(s) remain")
+        missing = [s for s in val_stems if s not in audio_index]
+        if missing:
+            print(f"WARNING: {len(missing)} validation file(s) have no audio and are skipped, e.g. {missing[:3]}")
+            val_stems = [s for s in val_stems if s in audio_index]
 
-    val_set = common.PamSequenceDataset(val_stems, audio_index, df_anno, band=band, augment=False,
-                                         bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None),
-                                         fusion_mode=fusion_mode)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        # Architecture (band_config incl. the CQT settings, use_attention) and
+        # label order come from the checkpoint, not from today's common.py.
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        if checkpoint.get("band", band) != band:
+            print(f"WARNING: checkpoint was trained as band={checkpoint.get('band')!r}, "
+                  f"but --band={band!r} was requested")
+        # v13: evaluate with the class set the checkpoint was TRAINED with (matters once
+        # classes have been added to class_config.json after this checkpoint was made)
+        if checkpoint.get('class_config'):
+            common.configure_classes(checkpoint['class_config'])
+        label_list = checkpoint.get("model_labels", common.BAND_LABELS[band])
+        rare_classes = set(checkpoint.get("rare_classes", []))
+        if args.mask_config:
+            common.configure_classes(args.mask_config)
+            if list(common.BAND_LABELS[band]) != list(label_list):
+                raise SystemExit(f"ERROR: --mask-config classes {common.BAND_LABELS[band]} != checkpoint {label_list}")
+            print(f"Evaluation masks from {args.mask_config}")
 
-    in_channels = 2 if (band == "joint" and fusion_mode == "channels") else 1
-    model = common.ImprovedCNNBiGRU(
-        in_channels=in_channels,
-        num_classes=len(label_list),
-        timesteps=common.timesteps_for_band(band),
-        fsteps=band_config["freq_bins"],
-        hidden_size=band_config["hidden_size"],
-        gru_layers=band_config.get("gru_layers", 3),
-        use_attention=use_attention,
-        pooled_freq_rows=band_config.get("pooled_freq_rows", 32),
-        fusion_mode=fusion_mode,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    print("Checkpoint epoch:", checkpoint.get("epoch"), "val F1 at save time:", checkpoint.get("best_f1"),
-          "use_attention:", use_attention)
+        # masks are always collected (and saved), so --no-mask can be re-run from the scores file
+        val_set = common.PamSequenceDataset(val_stems, audio_index, df_anno, band=band, augment=False,
+                                             bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None),
+                                             return_mask=True)
+        label_interval = val_set.label_interval
+        n_read = val_set.df_data["stem"].nunique() if len(val_set.df_data) else 0
+        if n_read < len(val_stems):
+            frac = 1 - n_read / max(1, len(val_stems))
+            msg = f"{len(val_stems) - n_read}/{len(val_stems)} validation files could not be read ({frac:.1%})"
+            if frac > 0.01 and not args.allow_skips:
+                raise SystemExit(f"ERROR: {msg} -- results would not be comparable. Fix the data access (slow/flaky "
+                                 f"network drive?) or pass --allow-skips.")
+            print(f"WARNING: {msg}; continuing (--allow-skips or <= 1%)")
+        model = common.load_model_from_checkpoint(checkpoint, device)   # v17: CQT single tower
+        print("Checkpoint epoch:", checkpoint.get("epoch"), "val score at save time:", checkpoint.get("best_f1"))
+        # v19: ONE pass -> per-window outputs (window calibration) + stitched timelines (everything else)
+        continuous, windows = eval_scores.infer(model, val_set, device, batch_size=args.batch_size,
+                                                num_workers=args.num_workers)
+        meta = dict(label_list=list(label_list), rare_classes=sorted(rare_classes), label_interval=label_interval,
+                    checkpoint=os.path.abspath(args.checkpoint), epoch=checkpoint.get("epoch"),
+                    mask_config=os.path.abspath(args.mask_config) if args.mask_config else "checkpoint")
+        eval_scores.save_scores(args.save_scores or os.path.join(args.output_dir, f"scores_{band}.npz"),
+                                continuous, windows, meta)
+
     if rare_classes:
         print(f"NOTE: {sorted(rare_classes)} had < {common.MIN_CLASS_COUNT_WARNING} training instances -- "
               f"their thresholds/F1 below are not reliable.")
-
-    os.makedirs(args.output_dir, exist_ok=True)
+    C = len(label_list)
+    label_true = windows["true"].transpose(0, 2, 1).reshape(-1, C).astype(np.float32)
+    label_pred = windows["pred"].transpose(0, 2, 1).reshape(-1, C)
+    label_mask = windows["mask"].transpose(0, 2, 1).reshape(-1, C).astype(np.float32)
 
     # -- "window" calibration: pool each overlapping window's own raw
     # score independently (no dedup across the 50%-overlap) -----------
-    label_pred, label_true = [], []
-    with torch.no_grad():
-        for x, y in tqdm(val_loader, desc="Inference"):
-            x = common._to_device(x, device)
-            yp = model(x)
-            for k in range(y.shape[0]):
-                label_true.append(pd.DataFrame(y.numpy()[k, :, :].T))
-                label_pred.append(pd.DataFrame(yp.detach().cpu().numpy()[k, :, :].T))
-    label_true = pd.concat(label_true, ignore_index=True).values
-    label_pred = pd.concat(label_pred, ignore_index=True).values
 
-    thresholds_window, f1_window, ap_window, curve_window = fit_thresholds(label_true, label_pred, label_list)
+    thresholds_window, f1_window, ap_window, curve_window = fit_thresholds(
+        label_true, label_pred, label_list, mask_2d=label_mask if use_mask else None)
     for i_class, lb in enumerate(label_list):
         flag = " [LOW N]" if lb in rare_classes else ""
         print(f"{lb}{flag}: [window] best_threshold={thresholds_window[i_class]:.4f} "
@@ -263,9 +321,6 @@ def main():
     # per-window predictions -- as the "window" pass above does -- would
     # double-count/fragment events; this dedups by taking the max score
     # per bin across whichever windows cover it). ----------------------
-    print("\nRunning continuous inference for event-level metrics + per-file breakdown...")
-    continuous = common.run_inference_continuous(model, val_set, device,
-                                                   batch_size=args.batch_size, num_workers=args.num_workers)
 
     # -- "continuous" calibration: same PR-curve fit, but against the
     # max-stitched scores instead of raw per-window ones. Since
@@ -291,7 +346,12 @@ def main():
     # sign to check for exactly this if it happens again.
     cont_true = np.concatenate([d["true"][:, d["covered"]].T for d in continuous.values()], axis=0)
     cont_pred = np.concatenate([d["scores"][:, d["covered"]].T for d in continuous.values()], axis=0)
-    thresholds_cont, f1_cont, ap_cont, curve_cont = fit_thresholds(cont_true, cont_pred, label_list)
+    cont_mask = np.concatenate([d["mask"][:, d["covered"]].T for d in continuous.values()], axis=0)
+    thresholds_cont, f1_cont, ap_cont, curve_cont = fit_thresholds(
+        cont_true, cont_pred, label_list, mask_2d=cont_mask if use_mask else None)
+    if use_mask:
+        n_scored = (cont_mask > 0).sum(axis=0)
+        print("Scored (unmasked) continuous bins per class:", dict(zip(label_list, n_scored.tolist())))
     for i_class, lb in enumerate(label_list):
         flag = " [LOW N]" if lb in rare_classes else ""
         print(f"{lb}{flag}: [continuous] best_threshold={thresholds_cont[i_class]:.4f} "
@@ -340,7 +400,10 @@ def main():
     for tag, thresholds_to_use in [("continuous", thresholds_cont), ("window", thresholds_window)]:
         event_rows = []
         for i_class, lb in enumerate(label_list):
-            m = common.event_level_metrics(continuous, i_class, thresholds_to_use[i_class], val_set.label_interval)
+            if np.isnan(thresholds_to_use[i_class]):
+                continue  # v19: no scored positives -> no threshold
+            m = common.event_level_metrics(continuous, i_class, thresholds_to_use[i_class], label_interval,
+                                           use_mask=use_mask)
             flag = " [LOW N]" if lb in rare_classes else ""
             print(f"{lb}{flag}: event-level [{tag}] precision={m['precision']:.3f} recall={m['recall']:.3f} "
                   f"f1={m['f1']:.3f} (tp={m['tp']} fp={m['fp']} fn={m['fn']})")
@@ -353,7 +416,7 @@ def main():
     # the default/unsuffixed output; window-calibrated is the explicitly
     # labeled comparison.
     for tag, thresholds_to_use in [("continuous", thresholds_cont), ("window", thresholds_window)]:
-        per_file_df = per_file_frame_metrics(continuous, label_list, thresholds_to_use)
+        per_file_df = per_file_frame_metrics(continuous, label_list, thresholds_to_use, use_mask=use_mask)
         suffix = "" if tag == "continuous" else "_window_threshold"
         out_path = os.path.join(args.output_dir, f"per_file_f1_{band}{suffix}.csv")
         per_file_df.to_csv(out_path, index=False)
@@ -369,8 +432,8 @@ def main():
                 print(with_calls.head(10).to_string(index=False))
 
     # training curves, if the log csv is next to the checkpoint
-    log_csv = os.path.join(os.path.dirname(args.checkpoint), f"bigru_{band}.csv")
-    if os.path.exists(log_csv):
+    log_csv = os.path.join(os.path.dirname(args.checkpoint), f"bigru_{band}.csv") if args.checkpoint else ""
+    if log_csv and os.path.exists(log_csv):
         log = pd.read_csv(log_csv)
         plt.figure(figsize=(6, 6))
         plt.subplot(211)

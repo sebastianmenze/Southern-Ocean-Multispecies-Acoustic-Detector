@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# AI-assisted code: developed with Claude Code (Anthropic); reviewed and tested by the SOMAD authors.
 """Apply a trained LF or HF checkpoint to every WAV file in a folder (e.g.
 the full APLOSE/hermine subset, not just the val split) and save the raw
 per-0.5s-bin model output for every class, for every file, into ONE
@@ -41,15 +42,15 @@ Run once per band (LF classes and HF classes need separate checkpoints).
 this script's scoring is continuous (run_inference_continuous, max-stitched
 across overlapping windows), and continuous scores run systematically
 higher than window ones, so a window-calibrated threshold applied here is
-measurably too permissive.
+measurably too permissive. See README's "v3 changes" #9/#11.
 
-Usage (SOMAD, the published joint model):
+Usage (nautilus, in Docker -- see run_nautilus_inference.sh):
 
-    python run_inference.py --band joint \
-        --checkpoint checkpoints/best_model.pth \
-        --thresholds-csv checkpoints/thresholds_joint_continuous.csv \
-        --audio-dir /path/to/your/wav/files \
-        --out scores_joint.nc
+    python run_inference.py \
+        --checkpoint /output/bigru_lf/best_model.pth \
+        --thresholds-csv /output/eval_lf/thresholds_lf_continuous.csv \
+        --audio-dir /data/hermine_SN8059_aplose_subset_2h \
+        --out /output/scores_lf.nc
 """
 
 import argparse
@@ -62,12 +63,12 @@ import xarray as xr
 from tqdm import tqdm
 
 import common
-from train_lf import build_argparser, resolve_defaults
+from somad_args import build_argparser, resolve_defaults
 
 
 def main():
     p = build_argparser()
-    p.add_argument("--band", choices=["lf", "hf", "joint"], required=True)
+    p.add_argument("--band", choices=["cqt"], default="cqt", help="v17 has one band, cqt (default)")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--thresholds-csv", required=True,
                     help="thresholds_<band>.csv from predict_eval.py -- its best_threshold per class gets "
@@ -134,24 +135,17 @@ def main():
     if not stems:
         raise SystemExit(f"No .wav files found under {audio_dir}")
 
-    # Read architecture/label metadata back from the checkpoint rather than
-    # from today's common.py defaults, so inference always matches whatever
-    # the checkpoint was actually trained with (band_config, use_attention,
-    # label order, fusion_mode can all drift over time as the pipeline
-    # evolves). Loaded BEFORE the dataset so it's built with the SAME
-    # fusion_mode the checkpoint was trained on -- "channels"/"twotower"
-    # produce a differently-shaped input than the "stack" default, so
-    # getting this wrong crashes (or silently mismatches) the very first
-    # inference call. Same pattern predict_eval.py/plot_confusion_matrix.py/
-    # plot_errors.py already use.
+    # Architecture (band_config incl. the CQT settings, use_attention) and
+    # label order come from the checkpoint, not from today's common.py.
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if checkpoint.get("band", band) != band:
         print(f"WARNING: checkpoint was trained as band={checkpoint.get('band')!r}, "
               f"but --band={band!r} was requested")
+    # v13: evaluate with the class set the checkpoint was TRAINED with (matters once
+    # classes have been added to class_config.json after this checkpoint was made)
+    if checkpoint.get('class_config'):
+        common.configure_classes(checkpoint['class_config'])
     label_list = checkpoint.get("model_labels", common.BAND_LABELS[band])
-    band_config = checkpoint.get("band_config", common.BAND_CONFIG[band])
-    use_attention = checkpoint.get("use_attention", False)
-    fusion_mode = checkpoint.get("fusion_mode", "stack")
 
     # No annotations needed for pure inference -- PamSequenceDataset's
     # labeling machinery just no-ops on an empty table (every window comes
@@ -169,25 +163,11 @@ def main():
     # is needed there.
     dataset = common.PamSequenceDataset(stems, audio_index, df_anno_empty, band=band, augment=False,
                                          full_coverage=True,
-                                         bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None),
-                                         fusion_mode=fusion_mode)
+                                         bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None))
 
-    in_channels = 2 if (band == "joint" and fusion_mode == "channels") else 1
-    model = common.ImprovedCNNBiGRU(
-        in_channels=in_channels,
-        num_classes=len(label_list),
-        timesteps=common.timesteps_for_band(band),
-        fsteps=band_config["freq_bins"],
-        hidden_size=band_config["hidden_size"],
-        gru_layers=band_config.get("gru_layers", 3),
-        use_attention=use_attention,
-        pooled_freq_rows=band_config.get("pooled_freq_rows", 32),
-        fusion_mode=fusion_mode,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    model = common.load_model_from_checkpoint(checkpoint, device)   # v17: CQT single tower
     print("Checkpoint epoch:", checkpoint.get("epoch"), "val F1 at save time:", checkpoint.get("best_f1"),
-          "fusion_mode:", fusion_mode)
+          "band_config:", checkpoint["band_config"])
 
     if "continuous" not in os.path.basename(args.thresholds_csv):
         print(f"WARNING: {args.thresholds_csv} doesn't look like a continuous-calibrated thresholds CSV "
@@ -200,6 +180,10 @@ def main():
     thr_df = pd.read_csv(args.thresholds_csv).set_index("label")
     thresholds = np.array([thr_df.loc[lb, "best_threshold"] for lb in label_list], dtype=np.float32)
     print("Using thresholds (logit space):", dict(zip(label_list, thresholds)))
+    nan_classes = [lb for lb, t in zip(label_list, thresholds) if np.isnan(t)]
+    if nan_classes:
+        print(f"WARNING: no calibrated threshold (no scored validation positives) for {nan_classes} -- "
+              f"these classes are never flagged above_threshold; their raw scores are still written.")
 
     if args.single_process:
         print("--single-process: running without DataLoader/worker processes "

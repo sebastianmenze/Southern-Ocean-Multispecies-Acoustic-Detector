@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir \
         torchaudio==2.9.1 \
     && pip install --no-cache-dir -r requirements.txt
 
-COPY src/*.py ./
+COPY . ./
 
 # /data holds the audio + annotation CSVs, /output holds checkpoints/logs,
 # /checkpoints holds the released SOMAD checkpoint + calibrated thresholds
@@ -36,4 +36,4 @@ COPY src/*.py ./
 ENV PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["python"]
-CMD ["train_joint.py", "--help"]
+CMD ["train_cqt.py", "--help"]

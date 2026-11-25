@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# AI-assisted code: developed with Claude Code (Anthropic); reviewed and tested by the SOMAD authors.
 # One-time setup: create a Python virtualenv (.venv) with everything
 # run_inference.py (and the other scripts here) need, no Docker/nautilus
 # required. Run this once; run_inference.sh activates .venv on its own
@@ -66,30 +67,51 @@ if [[ "$FORCE_CPU" -eq 1 ]]; then
     echo "== installing CPU-only torch (forced via --cpu) =="
     TORCH_INDEX="https://download.pytorch.org/whl/cpu"
 elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    echo "== nvidia-smi found -- installing CUDA 12.8 torch build (matches the Dockerfile's cuda12.8 base) =="
-    TORCH_INDEX="https://download.pytorch.org/whl/cu128"
+    # v10.1: auto-detect Pascal-generation GPUs (Tesla P100 and similar,
+    # compute capability 6.0/sm_60) and fall back to an OLDER CUDA-targeted
+    # torch build for them -- confirmed as a real, repeatable failure, not
+    # hypothetical: the newest cu128 torch wheels have DROPPED kernel
+    # support for sm_60 entirely ("no kernel image is available for
+    # execution on the device" at model init, only discovered after a full
+    # training run was already launched on a real P100 server). cu118
+    # wheels still ship sm_60 kernels, and a 580.x-series driver (new
+    # enough to report CUDA 13.0 in nvidia-smi) is backward-compatible with
+    # a cu118 runtime without issue. Matched by NAME ("P100") rather than
+    # trying to query compute capability directly, since nvidia-smi doesn't
+    # expose that without --query-gpu=compute_cap (not available on every
+    # driver version) -- "P100" in the name is a reliable enough proxy for
+    # this one known-bad generation; extend this list if another
+    # Pascal-era card (P40, P4, ...) turns out to have the same problem.
+    GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
+    if [[ "$GPU_NAME" == *"P100"* ]]; then
+        echo "== detected Pascal GPU ($GPU_NAME) -- cu128 torch has no sm_60 kernels, using cu118 instead =="
+        TORCH_INDEX="https://download.pytorch.org/whl/cu118"
+        TORCH_PIN='torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1'  # exact triplet known to ship sm_60 kernels
+    else
+        echo "== nvidia-smi found ($GPU_NAME) -- installing CUDA 12.8 torch build (matches the Dockerfile's cuda12.8 base) =="
+        TORCH_INDEX="https://download.pytorch.org/whl/cu128"
+        TORCH_PIN='torch>=2.4.1'
+    fi
 else
     echo "== no NVIDIA GPU detected -- installing CPU-only torch build (pass --cpu to skip this check) =="
     TORCH_INDEX="https://download.pytorch.org/whl/cpu"
+    TORCH_PIN='torch>=2.4.1'
 fi
 
 # v9.1: NOT hard-pinned to exact patch versions (2.9.1/0.24.1/2.9.1, matching
-# the Dockerfile) anymore -- confirmed as a real problem, not a hypothetical
-# one: torch==2.9.1 has no +cpu wheel at all for Python 3.9 on a real server
-# (anhur), capping out at 2.8.0+cpu there. A hard pin means this script's
-# only recovery from a too-new pin is someone manually discovering and
-# editing in a lower version by hand. `torch>=2.4.1` (the oldest version this
-# project has ever required) with torchvision/torchaudio left completely
-# unpinned instead lets pip pick whatever's the newest MUTUALLY COMPATIBLE
-# triplet actually available for this interpreter+platform on the index --
-# pip resolves torchvision/torchaudio's own metadata dependency on a
-# matching torch version correctly, so this doesn't risk landing on a
-# mismatched combination. Loading a checkpoint saved under a newer torch
-# (2.9.1) with a somewhat older one is normally fine for INFERENCE
-# specifically -- state_dict loading operates on plain tensor serialization,
-# not version-sensitive internals -- unlike training, where exact-version
-# reproducibility matters more.
-pip install --index-url "$TORCH_INDEX" "torch>=2.4.1" torchvision torchaudio
+# the Dockerfile) by default -- confirmed as a real problem, not a
+# hypothetical one: torch==2.9.1 has no +cpu wheel at all for Python 3.9 on
+# a real server (anhur), capping out at 2.8.0+cpu there. A hard pin means
+# this script's only recovery from a too-new pin is someone manually
+# discovering and editing in a lower version by hand. `torch>=2.4.1` (the
+# oldest version this project has ever required) with torchvision/
+# torchaudio left completely unpinned instead lets pip pick whatever's the
+# newest MUTUALLY COMPATIBLE triplet actually available for this
+# interpreter+platform on the index. The one exception is $TORCH_PIN's
+# Pascal branch above, which DOES pin an exact triplet -- there, the
+# constraint isn't "newest available," it's "oldest build still known to
+# ship sm_60 kernels at all," which an unpinned floor can't express.
+pip install --index-url "$TORCH_INDEX" $TORCH_PIN
 pip install -r requirements.txt
 
 echo

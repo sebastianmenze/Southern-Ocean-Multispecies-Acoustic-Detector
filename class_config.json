@@ -1,0 +1,359 @@
+{
+ "_comment": "v13 class + data-source definition. Edit this file (not common.py) to add a class or a data source. See CHANGES_v13.md section 'Adding a class later'.",
+ "classes": [
+  {
+   "name": "Fin whale 20 Hz",
+   "band": "lf",
+   "aplose_labels": [
+    "Fin whale 20 Hz"
+   ],
+   "soi_labels": [
+    "fw_20hz"
+   ]
+  },
+  {
+   "name": "Fin whale downsweep",
+   "band": "lf",
+   "aplose_labels": [
+    "Fin whale downsweep"
+   ],
+   "soi_labels": [
+    "fw_downsweep"
+   ]
+  },
+  {
+   "name": "Blue whale AB call",
+   "band": "lf",
+   "aplose_labels": [
+    "Blue whale A",
+    "Blue whale B",
+    "Blue whale A call",
+    "Blue whale B call"
+   ],
+   "soi_labels": [
+    "bw_a"
+   ]
+  },
+  {
+   "name": "Blue whale D call",
+   "band": "lf",
+   "aplose_labels": [
+    "Blue whale D",
+    "Blue whale D call"
+   ],
+   "soi_labels": [
+    "bw_dcall"
+   ]
+  },
+  {
+   "name": "Blue whale Z call",
+   "band": "lf",
+   "aplose_labels": [
+    "Blue whale Z call"
+   ],
+   "soi_labels": [
+    "bw_zcall"
+   ]
+  },
+  {
+   "name": "Blue whale ABZ call",
+   "band": "lf",
+   "aplose_labels": [],
+   "soi_labels": [],
+   "pooled_from": [
+    "Blue whale AB call",
+    "Blue whale Z call"
+   ]
+  },
+  {
+   "name": "Minke whale",
+   "band": "lf",
+   "aplose_labels": [
+    "Minke whale"
+   ],
+   "soi_labels": []
+  },
+  {
+   "name": "Southern right whale",
+   "band": "lf",
+   "aplose_labels": [
+    "Southern right whale",
+    "SRW"
+   ],
+   "soi_labels": [],
+   "annotated_in": [
+    "srw_*",
+    "hermine*",
+    "*soi*"
+   ]
+  },
+  {
+   "name": "Humpback",
+   "band": "hf",
+   "aplose_labels": [
+    "Humpback",
+    "Humpback squeaking",
+    "Humbpack groaning",
+    "Humpback song",
+    "Humpback LF tonal",
+    "Humpback impulse",
+    "Humpback bursts"
+   ],
+   "soi_labels": [
+    "humpback",
+    "humpbacks",
+    "humpack?"
+   ]
+  },
+  {
+   "name": "Leopard seal",
+   "band": "hf",
+   "aplose_labels": [
+    "Leopard seal"
+   ],
+   "soi_labels": [
+    "leopard_seal"
+   ]
+  },
+  {
+   "name": "Weddell seal",
+   "band": "hf",
+   "aplose_labels": [
+    "Weddell seal"
+   ],
+   "soi_labels": [
+    "weddell_seal"
+   ]
+  },
+  {
+   "name": "Crabeater seal",
+   "band": "hf",
+   "aplose_labels": [
+    "Crabeater seal"
+   ],
+   "soi_labels": [
+    "crabeater_seal"
+   ]
+  },
+  {
+   "name": "Orca",
+   "band": "hf",
+   "aplose_labels": [
+    "Orca"
+   ],
+   "soi_labels": [
+    "orca",
+    "orca?",
+    "orcas?"
+   ]
+  }
+ ],
+ "_uncertain_comment": "Raw labels that mark 'a call of this class may be here, not sure': NOT a positive and NOT a negative -- those bins are masked out of the loss for that class.",
+ "uncertain_labels": {
+  "Orca (uncertain)": "Orca",
+  "Humpback (uncertain)": "Humpback",
+  "Southern right whale (uncertain)": "Southern right whale"
+ },
+ "_stem_rules_comment": "File-name substring -> source name, checked before falling back to the audio folder name. Lets several sources share one flat audio folder.",
+ "stem_source_rules": [
+  {
+   "contains": "_DFOWDLP_",
+   "source": "dclde_wdlp"
+  },
+  {
+   "contains": "_DFOCRP_",
+   "source": "dclde_crp"
+  },
+  {
+   "contains": "_VFPAONC_",
+   "source": "dclde_vfpa"
+  },
+  {
+   "contains": "_VFPA_",
+   "source": "dclde_vfpa"
+  },
+  {
+   "contains": "_SRWEI_",
+   "source": "srw_ei"
+  },
+  {
+   "contains": "hermine_SN8059_",
+   "source": "hermine_SN8059_aplose_subset_2h"
+  },
+  {
+   "contains": "_SOI_",
+   "source": "2024_soi_train"
+  },
+  {
+   "contains": "ElephantIsland2013Aural",
+   "source": "bluefin_ElephantIsland2013Aural"
+  },
+  {
+   "contains": "BallenyIslands2015",
+   "source": "bluefin_BallenyIslands2015"
+  },
+  {
+   "contains": "ElephantIsland2014",
+   "source": "bluefin_ElephantIsland2014"
+  },
+  {
+   "contains": "Greenwich64S2015",
+   "source": "bluefin_Greenwich64S2015"
+  },
+  {
+   "contains": "kerguelen2005",
+   "source": "bluefin_kerguelen2005"
+  },
+  {
+   "contains": "kerguelen2014",
+   "source": "bluefin_kerguelen2014"
+  },
+  {
+   "contains": "kerguelen2015",
+   "source": "bluefin_kerguelen2015"
+  },
+  {
+   "contains": "MaudRise2014",
+   "source": "bluefin_MaudRise2014"
+  },
+  {
+   "contains": "RossSea2014",
+   "source": "bluefin_RossSea2014"
+  },
+  {
+   "contains": "casey2014",
+   "source": "bluefin_casey2014"
+  },
+  {
+   "contains": "casey2017",
+   "source": "bluefin_casey2017"
+  }
+ ],
+ "_bluefin_scope_comment": "v13 BlueFin policy: Blue whale D call and Fin whale downsweep come ONLY from Gerlache, SOI and Elephant Island (ElephantIsland2013Aural/2014); Kerguelen 2005/2014/2015 are used for every class they annotate EXCEPT Blue whale D call and Fin whale downsweep (their annotations there are dropped, and those classes are masked, not trained as negatives); every other BlueFin site-year is ignored entirely (split: ignore).",
+ "_bluefin_comment": "BlueFin library: only LF call types are annotated, and only the ones with a selection table per site-year (convert_bluefin_library.py SITES; e.g. no Minke whale at casey2014/casey2017/ElephantIsland2014/Greenwich64S2015/kerguelen2014/RossSea2014). Everything not listed is MASKED there, incl. all HF classes (the band-limited audio still carries LF energy of humpback/seals, so unannotated != absent). To use BlueFin as pure negatives for an HF class again, add that class to annotated_classes.",
+ "_sources_comment": "Keys are glob patterns matched (first match wins) against the source name = stem rule result or the audio folder name. annotated_classes: 'all' or a list = classes this source was actually annotated for; every other class is MASKED (no loss, no metric) for its files. split: random | train_only | val_only. val_only_classes: a file containing any annotation of these classes is forced into validation (and those annotations never reach training). sample_weight: multiplier on how often this source's windows are drawn.",
+ "sources": {
+  "dclde_wdlp": {
+   "split": "ignore"
+  },
+  "dclde_crp": {
+   "split": "ignore"
+  },
+  "dclde_vfpa": {
+   "split": "ignore"
+  },
+  "srw_*": {
+   "annotated_classes": [
+    "Southern right whale"
+   ],
+   "split": "random",
+   "sample_weight": 1.0
+  },
+  "hermine*": {
+   "annotated_classes": [
+    "Fin whale 20 Hz",
+    "Blue whale AB call",
+    "Blue whale D call",
+    "Blue whale Z call",
+    "Minke whale",
+    "Southern right whale",
+    "Humpback",
+    "Leopard seal",
+    "Weddell seal",
+    "Crabeater seal",
+    "Orca",
+    "Blue whale ABZ call"
+   ],
+   "split": "random"
+  },
+  "*soi*": {
+   "annotated_classes": "all",
+   "split": "random"
+  },
+  "bluefin_BallenyIslands2015": {
+   "split": "ignore"
+  },
+  "bluefin_casey2014": {
+   "split": "ignore"
+  },
+  "bluefin_casey2017": {
+   "split": "ignore"
+  },
+  "bluefin_ElephantIsland2013Aural": {
+   "annotated_classes": [
+    "Fin whale 20 Hz",
+    "Fin whale downsweep",
+    "Blue whale AB call",
+    "Blue whale D call",
+    "Blue whale Z call",
+    "Minke whale",
+    "Blue whale ABZ call"
+   ],
+   "split": "random"
+  },
+  "bluefin_ElephantIsland2014": {
+   "annotated_classes": [
+    "Fin whale 20 Hz",
+    "Fin whale downsweep",
+    "Blue whale AB call",
+    "Blue whale D call",
+    "Blue whale Z call",
+    "Blue whale ABZ call"
+   ],
+   "split": "random"
+  },
+  "bluefin_Greenwich64S2015": {
+   "split": "ignore"
+  },
+  "bluefin_kerguelen2005": {
+   "annotated_classes": [
+    "Fin whale 20 Hz",
+    "Fin whale downsweep",
+    "Blue whale AB call",
+    "Blue whale D call",
+    "Blue whale Z call",
+    "Minke whale",
+    "Blue whale ABZ call"
+   ],
+   "split": "random"
+  },
+  "bluefin_kerguelen2014": {
+   "annotated_classes": [
+    "Fin whale 20 Hz",
+    "Fin whale downsweep",
+    "Blue whale AB call",
+    "Blue whale D call",
+    "Blue whale Z call",
+    "Blue whale ABZ call"
+   ],
+   "split": "random"
+  },
+  "bluefin_kerguelen2015": {
+   "annotated_classes": [
+    "Fin whale 20 Hz",
+    "Blue whale AB call",
+    "Blue whale D call",
+    "Blue whale Z call",
+    "Minke whale",
+    "Blue whale ABZ call"
+   ],
+   "split": "random"
+  },
+  "bluefin_MaudRise2014": {
+   "split": "ignore"
+  },
+  "bluefin_RossSea2014": {
+   "split": "ignore"
+  },
+  "bluefin*": {
+   "split": "ignore"
+  }
+ },
+ "source_defaults": {
+  "annotated_classes": "all",
+  "split": "random",
+  "sample_weight": 1.0
+ },
+ "_v18_comment": "v18b: v17 data/masks unchanged, plus pooled class 'Blue whale ABZ call' (annotated wherever blue whale AB or Z is annotated).",
+ "_v19_comment": "v19: Fin whale downsweep is MASKED for bluefin_kerguelen2015 -- that site's downsweep table is a copy of Kerguelen 2014's (see fix_kerguelen2015_downsweep.py), so the real 2015 downsweeps are unknown: neither positive nor negative. Everything else as v18. Humpback is MASKED for every BlueFin source: the BlueFin library has no humpback annotations, so v18 trained all BlueFin audio as humpback negatives although calls may be present (unannotated != absent)."
+}

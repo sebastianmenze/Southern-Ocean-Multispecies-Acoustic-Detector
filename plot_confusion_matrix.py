@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# AI-assisted code: developed with Claude Code (Anthropic); reviewed and tested by the SOMAD authors.
 """Confusion matrix plots for a trained LF or HF checkpoint's validation
 split. Two complementary views, since this is a multi-label problem
 (several classes can be true/predicted in the very same 0.5s bin -- there
@@ -36,24 +37,25 @@ with raw-score tie-breaking (it's not a tie-breaking problem, it really
 does cross its own threshold almost everywhere), drowning out the more
 meaningful cross-class confusion in the combined plot; and its own
 precision/recall are already known to be near-meaningless at this sample
-size, so there's little reason to keep it cluttering the per-class grid
-either while it's this data-starved. Pass --exclude-labels with no
-arguments to see every class in both plots.
+size (see README's "Rare-class handling"), so there's little reason to
+keep it cluttering the per-class grid either while it's this data-starved.
+Pass --exclude-labels with no arguments to see every class in both plots.
 
 Uses the SAME continuous-timeline stitching (common.run_inference_continuous)
-and expects the same CONTINUOUS-calibrated thresholds as the rest of this
-pipeline (window-calibrated thresholds are measurably too permissive
-against continuous-stitched scores) -- pass thresholds_<band>_continuous.csv,
-not the plain thresholds_<band>.csv.
+and expects the same CONTINUOUS-calibrated thresholds as the rest of the
+deployment pipeline (see README's "v3 changes" #9/#11/#12 for why --
+window-calibrated thresholds are measurably too permissive against
+continuous-stitched scores) -- pass thresholds_<band>_continuous.csv, not
+the plain thresholds_<band>.csv.
 
 Also saves the raw counts behind both plots as CSVs.
 
-Usage (SOMAD, the published joint model):
+Usage (nautilus, in Docker -- see run_nautilus_confusion_matrix.sh):
 
-    python plot_confusion_matrix.py --band joint \
-        --checkpoint checkpoints/best_model.pth \
-        --thresholds-csv checkpoints/thresholds_joint_continuous.csv \
-        --output-dir confmat_joint
+    python plot_confusion_matrix.py \
+        --checkpoint /output/bigru_lf/best_model.pth \
+        --thresholds-csv /output/eval_lf/thresholds_lf_continuous.csv \
+        --output-dir /output/confusion_lf
 """
 
 import argparse
@@ -69,11 +71,21 @@ from sklearn.metrics import confusion_matrix, multilabel_confusion_matrix
 from torch.utils.data import DataLoader
 
 import common
-from train_lf import build_argparser, resolve_defaults
+import eval_scores
+from somad_args import build_argparser, resolve_defaults
 
 
-def plot_per_class(all_true, all_pred, label_list, out_dir, band):
-    cms = multilabel_confusion_matrix(all_true, all_pred)  # (C, 2, 2): [[TN, FP], [FN, TP]]
+def plot_per_class(all_true, all_pred, label_list, out_dir, band, all_mask=None):
+    """v19: `all_mask` (N, C, 1 = scored) -> each class's 2x2 only counts its scored bins."""
+    if all_mask is None:
+        cms = multilabel_confusion_matrix(all_true, all_pred)  # (C, 2, 2): [[TN, FP], [FN, TP]]
+    else:
+        cms = []
+        for i in range(all_true.shape[1]):
+            k = all_mask[:, i] > 0
+            t, pr = all_true[k, i], all_pred[k, i]
+            cms.append(np.array([[((t == 0) & (pr == 0)).sum(), ((t == 0) & (pr == 1)).sum()],
+                                 [((t == 1) & (pr == 0)).sum(), ((t == 1) & (pr == 1)).sum()]]))
 
     n = len(label_list)
     ncols = min(3, n)
@@ -109,7 +121,8 @@ def plot_per_class(all_true, all_pred, label_list, out_dir, band):
     for ax in axes[n:]:
         ax.axis("off")
 
-    fig.suptitle(f"{band.upper()} — per-class confusion matrix (validation split, 0.5s bins)")
+    fig.suptitle(f"{band.upper()} — per-class confusion matrix (validation split, 0.5s bins"
+                 f"{', masked: only bins where the class was annotated' if all_mask is not None else ''})")
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"confusion_matrix_per_class_{band}.png"), dpi=110)
     plt.close(fig)
@@ -178,8 +191,13 @@ def plot_combined(all_true, all_pred, all_scores, thresholds, label_list, out_di
 
 def main():
     p = build_argparser()
-    p.add_argument("--band", choices=["lf", "hf", "joint"], required=True)
-    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--band", choices=["cqt"], default="cqt", help="v17 has one band, cqt (default)")
+    p.add_argument("--checkpoint", default=None, help="not needed with --load-scores")
+    p.add_argument("--load-scores", default=None,
+                    help="v19: scores .npz from predict_eval.py (no model run, no audio needed)")
+    p.add_argument("--val-list", default=None, help="v19: only these file stems (a subset of the validation split)")
+    p.add_argument("--no-mask", action="store_true",
+                    help="v19: count masked bins (out-of-scope classes, uncertain annotations) like v18")
     p.add_argument("--thresholds-csv", required=True,
                     help="thresholds_<band>_continuous.csv from predict_eval.py -- always the continuous "
                          "one, see module docstring.")
@@ -199,76 +217,63 @@ def main():
               f"unless you specifically intend otherwise.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    keep_stems = eval_scores.read_list(args.val_list) if args.val_list else None
+    use_mask = not args.no_mask
 
-    # common.resolve_audio_dirs (not a hand-rolled list) -- it conditionally
-    # includes --bluefin-dir for band=="lf" (see its own docstring); an LF
-    # checkpoint is trained with bluefin data by default, so its saved
-    # val_files.txt below lists bluefin stems (named after their original
-    # site, e.g. "..._kerguelen2005_...") that would otherwise KeyError
-    # against an audio_index that never included that data at all.
-    audio_dirs = common.resolve_audio_dirs(args, band)
-    df_anno, audio_index = common.build_dataset_table(args.aplose_csv, args.soi_csv, audio_dirs)
-
-    val_files_path = os.path.join(os.path.dirname(args.checkpoint), "val_files.txt")
-    if os.path.exists(val_files_path):
-        with open(val_files_path) as f:
-            val_stems = [l.strip() for l in f if l.strip()]
+    if args.load_scores:
+        continuous, _, meta = eval_scores.load_scores(args.load_scores, keep_stems)
+        label_list = meta["label_list"]
     else:
-        _, val_stems = common.split_files(audio_index, val_fraction=args.val_fraction, seed=args.seed)
-
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    if checkpoint.get("band", band) != band:
-        print(f"WARNING: checkpoint was trained as band={checkpoint.get('band')!r}, but --band={band!r} "
-              f"was requested")
-    label_list = checkpoint.get("model_labels", common.BAND_LABELS[band])
-    band_config = checkpoint.get("band_config", common.BAND_CONFIG[band])
-    use_attention = checkpoint.get("use_attention", False)
-    fusion_mode = checkpoint.get("fusion_mode", "stack")
-
-    # fusion_mode read from the checkpoint BEFORE building val_set -- see
-    # predict_eval.py's identical comment for why (channels/twotower need
-    # a differently-shaped dataset input than the stack default).
-    val_set = common.PamSequenceDataset(val_stems, audio_index, df_anno, band=band, augment=False,
-                                         bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None),
-                                         fusion_mode=fusion_mode)
-
-    in_channels = 2 if (band == "joint" and fusion_mode == "channels") else 1
-    model = common.ImprovedCNNBiGRU(
-        in_channels=in_channels,
-        num_classes=len(label_list),
-        timesteps=common.timesteps_for_band(band),
-        fsteps=band_config["freq_bins"],
-        hidden_size=band_config["hidden_size"],
-        gru_layers=band_config.get("gru_layers", 3),
-        use_attention=use_attention,
-        pooled_freq_rows=band_config.get("pooled_freq_rows", 32),
-        fusion_mode=fusion_mode,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    print("Checkpoint epoch:", checkpoint.get("epoch"), "val F1 at save time:", checkpoint.get("best_f1"),
-          "use_attention:", use_attention)
+        if not args.checkpoint:
+            raise SystemExit("ERROR: --checkpoint is required unless --load-scores is given")
+        # common.resolve_audio_dirs (not a hand-rolled list): includes --bluefin-dir,
+        # whose stems the checkpoint's val_files.txt can list.
+        audio_dirs = common.resolve_audio_dirs(args, band)
+        df_anno, audio_index = common.build_dataset_table(args.aplose_csv, args.soi_csv, audio_dirs)
+        val_files_path = os.path.join(os.path.dirname(args.checkpoint), "val_files.txt")
+        if keep_stems is not None:
+            val_stems = keep_stems
+        elif os.path.exists(val_files_path):
+            val_stems = eval_scores.read_list(val_files_path)
+        else:
+            _, val_stems = common.get_split(args, audio_index, df_anno)
+        val_stems = [s for s in val_stems if s in audio_index]
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        # v13: evaluate with the class set the checkpoint was TRAINED with
+        if checkpoint.get('class_config'):
+            common.configure_classes(checkpoint['class_config'])
+        label_list = checkpoint.get("model_labels", common.BAND_LABELS[band])
+        val_set = common.PamSequenceDataset(val_stems, audio_index, df_anno, band=band, augment=False,
+                                             bluefin_hf_dir=getattr(args, "bluefin_hf_dir", None), return_mask=True)
+        model = common.load_model_from_checkpoint(checkpoint, device)   # v17: CQT single tower
+        print("Running continuous inference over the validation split...")
+        continuous, _ = eval_scores.infer(model, val_set, device, batch_size=args.batch_size,
+                                          num_workers=args.num_workers)
 
     thr_df = pd.read_csv(args.thresholds_csv).set_index("label")
     thresholds = np.array([thr_df.loc[lb, "best_threshold"] for lb in label_list], dtype=np.float32)
     print("Using thresholds (logit space):", dict(zip(label_list, thresholds)))
-
-    print("Running continuous inference over the validation split...")
-    continuous = common.run_inference_continuous(model, val_set, device,
-                                                   batch_size=args.batch_size, num_workers=args.num_workers)
+    print("Evaluation:", "MASKED" if use_mask else "UNMASKED (--no-mask)")
 
     # Only covered bins -- same reasoning as predict_eval.py's threshold
     # fit and run_inference.py's netCDF export: an uncovered bin's -1e4
     # sentinel score is not a real prediction and would corrupt the
     # combined matrix's argmax (see README's "v3 changes" #11).
-    all_true, all_scores = [], []
+    all_true, all_scores, all_mask = [], [], []
     for d in continuous.values():
         covered = d["covered"]
         all_true.append(d["true"][:, covered].T)
         all_scores.append(d["scores"][:, covered].T)
+        all_mask.append(d["mask"][:, covered].T)
     all_true = np.concatenate(all_true, axis=0).astype(int)      # (N, C) 0/1
     all_scores = np.concatenate(all_scores, axis=0)               # (N, C) raw logits
-    all_pred = (all_scores > thresholds[None, :]).astype(int)     # (N, C) 0/1
+    all_mask = np.concatenate(all_mask, axis=0) if use_mask else np.ones_like(all_scores)
+    # a class without a calibrated threshold (no scored positives) is never predicted
+    all_pred = (all_scores > np.nan_to_num(thresholds, nan=np.inf)[None, :]).astype(int)   # (N, C) 0/1
+    # v19 masks: a masked class can be neither the truth nor the prediction of a bin
+    all_true = all_true * (all_mask > 0)
+    all_pred = all_pred * (all_mask > 0)
+    all_scores = np.where(all_mask > 0, all_scores, -np.inf)
     print(f"{all_true.shape[0]:,} covered bins across {len(continuous)} validation files")
 
     # Applied once, upstream of both plots (not per-plot) -- a class with
@@ -291,10 +296,12 @@ def main():
         all_true = all_true[:, keep_idx]
         all_pred = all_pred[:, keep_idx]
         all_scores = all_scores[:, keep_idx]
+        all_mask = all_mask[:, keep_idx]
         thresholds = thresholds[keep_idx]
 
     os.makedirs(args.output_dir, exist_ok=True)
-    per_class_df = plot_per_class(all_true, all_pred, label_list, args.output_dir, band)
+    per_class_df = plot_per_class(all_true, all_pred, label_list, args.output_dir, band,
+                                  all_mask=all_mask if use_mask else None)
     print("\nPer-class:")
     print(per_class_df.to_string(index=False))
 

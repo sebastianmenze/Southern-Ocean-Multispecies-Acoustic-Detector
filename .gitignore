@@ -1,21 +1,6 @@
-# Python
+.venv/
 __pycache__/
 *.pyc
-.venv/
-*.egg-info/
-
-# Data / outputs a user will generate locally, never something to commit
-/data/
-/output/
+checkpoints/*.pth
 *.nc
-
-# Neither checkpoint belongs in git: latest_checkpoint.pth is always an
-# in-progress training artifact, and best_model.pth (the released weights)
-# is archived on Zenodo instead -- see README.md's "Getting the checkpoint"
-# -- so excluding it here prevents an accidental 2 GB commit.
-checkpoints/latest_checkpoint.pth
-checkpoints/best_model.pth
-
-# OS cruft
-.DS_Store
-Thumbs.db
+output*/
