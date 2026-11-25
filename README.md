@@ -164,8 +164,39 @@ print(events["predicted_label"].value_counts())
 
 ## Training on your own data and adding classes
 
-1. **Collect the data.** Put the audio in `<training folder>/audio/` and the box annotations in an APLOSE-style CSV in the same folder. The CSV has one row per box: file, start and end time, low and high frequency, label.
-2. **Configure the classes.** Declare the classes and their source labels in `class_config.json`. Under `sources`, list which classes each data source was annotated for. Every other class is masked for that source's files, so its unannotated calls do not count as negatives.
+1. **Collect the data.** Put the .wav files in `<training folder>/audio/`. Put an annotation table whose name contains `aplose` (e.g. `annotations_aplose.csv`) in `<training folder>/`. It needs one row per annotation with these columns (APLOSE result exports already have them):
+
+   | Column | Content |
+   |---|---|
+   | `filename` | audio file name |
+   | `start_datetime`, `end_datetime` | absolute ISO 8601 times, e.g. `2024-04-17T03:12:05.500+00:00` |
+   | `annotation` | the label |
+   | `type` (optional) | `WEAK` marks presence-only annotations, which are not used |
+
+   Frequency bounds are not needed: SOMAD labels 0.5 s time bins per class. The start time of each audio file is read from its name, which must contain it as `YYYY_MM_DD_HH_MM_SS`.
+
+2. **Configure classes and sources in `class_config.json`** (next to the scripts). The released file holds the full 11-class configuration used in the paper; add new classes and sources to it.
+   - **Classes.** Each class maps one model output to one or more annotation labels. `band` (`"lf"` or `"hf"`) is required by the file format but does not affect the single VQT model.
+   - **Uncertain labels.** Labels listed under `uncertain_labels` mask that class for the annotated time instead of counting as a positive.
+   - **Sources.** `stem_source_rules` assigns files to a data source by a substring of their name. Each entry in `sources` (glob patterns allowed) sets which classes that source was annotated for in `annotated_classes`. Every other class is masked for its files, so its unannotated calls do not count as negatives. `split` is one of `random`, `train_only`, `val_only` or `ignore`. `sample_weight` scales how often the source's windows are drawn.
+
+   For example, to add a bearded seal class annotated only in one new data set:
+
+   ```json
+   {
+     "classes": [
+       {"name": "Leopard seal", "band": "hf", "aplose_labels": ["Leopard seal"]},
+       {"name": "Bearded seal", "band": "hf", "aplose_labels": ["Bearded seal", "Erignathus trill"]}
+     ],
+     "uncertain_labels": {"Bearded seal (uncertain)": "Bearded seal"},
+     "stem_source_rules": [{"contains": "_ARCTIC01_", "source": "arctic01"}],
+     "sources": {
+       "arctic01": {"annotated_classes": ["Bearded seal"], "split": "random"}
+     },
+     "source_defaults": {"annotated_classes": "all", "split": "random", "sample_weight": 1.0}
+   }
+   ```
+
 3. **Run the pipeline:**
 
 ```bash
