@@ -6,9 +6,7 @@
 <p align="center"><b>Southern Ocean Multispecies Acoustic Detector</b></p>
 
 <p align="center">
-
-[![DOI](https://zenodo.org/badge/github/1401426226.svg)](https://doi.org/10.5281/zenodo.24555517)
-
+  <a href="https://doi.org/10.5281/zenodo.24555517"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.24555517.svg" alt="DOI"/></a>
 </p>
 
 SOMAD detects 11 co-occurring Southern Ocean marine mammal call types in **one forward pass over a 60 s, 7.8 Hz–16 kHz acoustic scene**. It scores every class every 0.5 s.
